@@ -57,6 +57,8 @@ Operators
    deepinv.physics.Pansharpen
    deepinv.physics.CompressiveSpectralImaging
    deepinv.physics.HyperSpectralUnmixing
+   deepinv.physics.PalimpsestAttenuation
+   deepinv.physics.PalimpsestOpticalDensity
    deepinv.physics.CompressedSensing
    deepinv.physics.StructuredRandom
    deepinv.physics.SinglePixelCamera

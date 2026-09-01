@@ -3,7 +3,14 @@ import torch
 
 import deepinv as dinv
 from deepinv.models import TextLayerSeparator, contrast_background
-from deepinv.physics import CrosshatchTextOverlay, rotate, rotate_adjoint
+from deepinv.physics import (
+    CrosshatchTextOverlay,
+    canvas_size,
+    center_crop,
+    center_pad,
+    rotate,
+    rotate_adjoint,
+)
 
 IMG_SIZES = [(1, 32, 32), (3, 32, 48)]
 ANGLE_SETS = [(0.0,), (0.0, 90.0), (0.0, 45.0, 90.0)]
@@ -12,6 +19,11 @@ ANGLE_SETS = [(0.0,), (0.0, 90.0), (0.0, 45.0, 90.0)]
 def overlay(img_size=(1, 32, 32), angles=(0.0, 90.0), device="cpu", **kwargs):
     """Build a CrosshatchTextOverlay with defaults shared by the tests below."""
     return CrosshatchTextOverlay(img_size, angles=angles, device=device, **kwargs)
+
+
+def sources(physics, batch=1, device="cpu"):
+    """Random sources on the canvas this operator parametrizes its layers on."""
+    return torch.rand(batch, *physics.source_size, device=device)
 
 
 @pytest.mark.parametrize("angle", (0.0, 30.0, 90.0, 180.0))
@@ -46,8 +58,10 @@ def test_overlay_shapes(img_size, angles, device):
     channels, height, width = img_size
 
     assert physics.n_layers == len(angles)
+    side = canvas_size(img_size)
+    assert physics.source_size == (len(angles) + 1, channels, side, side)
 
-    x = torch.rand(2, len(angles) + 1, channels, height, width, device=device)
+    x = sources(physics, 2, device)
     y = physics.A(x)
     assert y.shape == (2, channels, height, width)
 
@@ -60,21 +74,22 @@ def test_overlay_shapes(img_size, angles, device):
 def test_overlay_adjointness(img_size, angles, device):
     """The operator is linear, so it must pass deepinv's adjointness test."""
     physics = overlay(img_size, angles, device=device)
-    x = torch.rand(2, len(angles) + 1, *img_size, device=device)
+    x = sources(physics, 2, device)
 
     assert physics.adjointness_test(x).abs() < 1e-4
 
 
 def test_overlay_is_additive(device):
-    """A(x) is exactly the background plus each rotated, weighted layer."""
+    """A(x) is the background plus each rotated, weighted layer, cropped to the image."""
     angles, amplitudes = (0.0, 90.0), (0.5, 0.25)
     physics = overlay((1, 32, 32), angles, amplitudes=amplitudes, device=device)
 
-    x = torch.rand(2, 3, 1, 32, 32, device=device)
-    expected = (
+    x = sources(physics, 2, device)
+    expected = center_crop(
         x[:, 0]
         + amplitudes[0] * rotate(x[:, 1], angles[0])
-        + amplitudes[1] * rotate(x[:, 2], angles[1])
+        + amplitudes[1] * rotate(x[:, 2], angles[1]),
+        (1, 32, 32),
     )
 
     assert torch.allclose(physics.A(x), expected, atol=1e-6)
@@ -82,8 +97,8 @@ def test_overlay_is_additive(device):
 
 def test_overlay_linearity(device):
     physics = overlay(device=device)
-    x1 = torch.rand(1, 3, 1, 32, 32, device=device)
-    x2 = torch.rand(1, 3, 1, 32, 32, device=device)
+    x1 = sources(physics, 1, device)
+    x2 = sources(physics, 1, device)
 
     assert torch.allclose(
         physics.A(2.0 * x1 + 3.0 * x2),
@@ -96,7 +111,7 @@ def test_overlay_zero_amplitude_drops_layer(device):
     """A layer with zero amplitude cannot influence the measurement."""
     physics = overlay(angles=(0.0, 90.0), amplitudes=(1.0, 0.0), device=device)
 
-    x = torch.rand(1, 3, 1, 32, 32, device=device)
+    x = sources(physics, 1, device)
     x_other = x.clone()
     x_other[:, 2] = torch.rand_like(x[:, 2])
 
@@ -106,7 +121,7 @@ def test_overlay_zero_amplitude_drops_layer(device):
 def test_angles_are_settable_by_hand(device):
     """Angles can be written by hand, persistently or for a single call."""
     physics = overlay(angles=(0.0, 90.0), device=device)
-    x = torch.rand(1, 3, 1, 32, 32, device=device)
+    x = sources(physics, 1, device)
 
     # Persistent update, accepting a plain tuple
     physics.update_parameters(angles=(12.0, 78.0))
@@ -135,7 +150,7 @@ def test_changing_the_number_of_layers(device):
     physics.update_parameters(angles=(0.0, 60.0, 120.0), amplitudes=(1.0, 0.5, 0.5))
     assert physics.n_layers == 3
 
-    x = torch.rand(1, 4, 1, 32, 32, device=device)
+    x = sources(physics, 1, device)
     assert physics.A(x).shape == (1, 1, 32, 32)
 
     # Changing angles alone must not silently leave amplitudes the wrong length
@@ -182,6 +197,54 @@ def test_overlay_errors(device):
         physics.A(torch.rand(1, 2, 1, 32, 32, device=device))
 
 
+def test_overlay_canvas_geometry(device):
+    """Sources live on the canvas, the measurement on the image grid."""
+    physics = overlay((1, 32, 32), (0.0, 90.0), device=device)
+
+    assert physics.canvas == 46
+    assert physics.source_size == (3, 1, 46, 46)
+    assert physics.A(sources(physics, 1, device)).shape == (1, 1, 32, 32)
+
+
+def test_overlay_rejects_sources_on_the_image_grid(device):
+    """Passing layers on the image grid is the mistake the canvas guards against."""
+    physics = overlay((1, 32, 32), (0.0, 90.0), device=device)
+
+    with pytest.raises(ValueError, match="canvas"):
+        physics.A(torch.rand(1, 3, 1, 32, 32, device=device))
+
+
+def test_overlay_content_outside_the_frame_reaches_the_measurement(device):
+    """
+    The regression the canvas exists for.
+
+    Text lying outside the observed window but rotating into it must reach the measurement.
+    Parametrizing the layers on the image grid forces that content to zero instead.
+    """
+    physics = overlay((1, 32, 32), (45.0, 45.0), device=device)
+    side = physics.canvas
+    start = (side - 32) // 2
+
+    x = torch.zeros(1, 3, 1, side, side, device=device)
+    x[:, 1] = 1.0
+    x[:, 1, :, start : start + 32, start : start + 32] = (
+        0.0  # blank the observed window
+    )
+
+    assert bool((physics.A(x) > 1e-6).any())
+
+
+def test_overlay_adjoint_places_the_measurement_back_on_the_canvas(device):
+    """A crops, so its adjoint pads: the background back-projection is the padded image."""
+    physics = overlay((1, 32, 32), (0.0, 90.0), device=device)
+    y = torch.rand(1, 1, 32, 32, device=device)
+
+    back = physics.A_adjoint(y)
+
+    assert back.shape == (1, 3, 1, 46, 46)
+    assert torch.allclose(back[:, 0], center_pad(y, 46), atol=1e-6)
+
+
 @pytest.mark.parametrize("n_layers", (1, 2, 3))
 @pytest.mark.parametrize("in_channels", (1, 3))
 def test_separator_shapes(n_layers, in_channels, device):
@@ -194,7 +257,8 @@ def test_separator_shapes(n_layers, in_channels, device):
     y = torch.rand(2, in_channels, 32, 32, device=device)
     x_hat = model(y, physics)
 
-    assert x_hat.shape == (2, n_layers + 1, in_channels, 32, 32)
+    side = canvas_size((in_channels, 32, 32))
+    assert x_hat.shape == (2, n_layers + 1, in_channels, side, side)
     assert x_hat.dtype == y.dtype
 
 
@@ -216,8 +280,8 @@ def test_separator_without_consistency(device):
     )
     y = torch.rand(2, 1, 32, 32, device=device)
 
-    x_hat = model(y)  # physics is not needed here
-    assert x_hat.shape == (2, 3, 1, 32, 32)
+    x_hat = model(y, canvas=46)  # physics is not needed here, only the canvas
+    assert x_hat.shape == (2, 3, 1, 46, 46)
 
 
 def test_separator_nonnegative_layers(device):
@@ -248,7 +312,7 @@ def test_separator_can_fit_a_fixed_example(device):
     physics = overlay((1, 32, 32), (0.0, 90.0), device=device)
     model = TextLayerSeparator(in_channels=1, n_layers=2, device=device)
 
-    x = torch.rand(1, 3, 1, 32, 32, device=device)
+    x = sources(physics, 1, device)
     y = physics.A(x)
 
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
@@ -286,22 +350,29 @@ def test_contrast_background_handles_empty_layer(device):
 
 
 def test_separation_end_to_end_with_text_generator(device):
-    """Compose real text layers through the physics and check the pipeline runs."""
+    """
+    Compose real text layers through the physics and check the pipeline runs.
+
+    The generator's ``canvas=True`` layers are exactly the domain the operator parametrizes its
+    sources on, so the two halves of the pipeline agree without any resizing in between.
+    """
     img_size = (1, 64, 64)
+    physics = overlay(img_size, (0.0, 90.0), amplitudes=(0.4, 0.4), device=device)
+    side = physics.canvas
+
     gen = dinv.physics.generator.CrosshatchTextMaskGenerator(
         img_size, text="DEEPINV", angles=(0.0,), device=device
     )
-    upright = gen.layer_fields()[0]
+    upright = gen.layer_fields(canvas=True)[0]
+    assert upright.shape == (side, side)
 
-    physics = overlay(img_size, (0.0, 90.0), amplitudes=(0.4, 0.4), device=device)
-    background = torch.rand(1, 1, 64, 64, device=device) * 0.5
-    x = torch.stack(
-        [background, upright.expand(1, 1, 64, 64), upright.expand(1, 1, 64, 64)], dim=1
-    )
+    background = torch.rand(1, 1, side, side, device=device) * 0.5
+    layer = upright.expand(1, 1, side, side)
+    x = torch.stack([background, layer, layer], dim=1)
     y = physics.A(x)
 
-    # Adding text on top can only brighten the background
-    assert (y >= background - 1e-6).all()
+    # Adding text on top can only brighten the background, over the observed window
+    assert (y >= center_crop(background, img_size) - 1e-6).all()
 
     model = TextLayerSeparator(in_channels=1, n_layers=2, device=device)
     x_hat = model(y, physics)

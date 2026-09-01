@@ -88,6 +88,8 @@ This is particular useful when dealing with blind inverse problems or parameter 
      -
        | :class:`deepinv.physics.Pansharpen`
        | :class:`deepinv.physics.HyperSpectralUnmixing`
+       | :class:`deepinv.physics.PalimpsestAttenuation`
+       | :class:`deepinv.physics.PalimpsestOpticalDensity`
        | :class:`deepinv.physics.CompressiveSpectralImaging`
      -
 

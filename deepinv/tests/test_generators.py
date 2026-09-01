@@ -817,29 +817,68 @@ def test_crosshatch_layers_differ_between_angles(device, rng):
     assert not torch.equal(layers[0], layers[1])
 
 
+@pytest.mark.parametrize("img_size", [(1, 64, 64), (1, 64, 40)])
+def test_crosshatch_layer_fields_canvas(img_size, device, rng):
+    """canvas=True returns the layers on the domain the separation operators expect."""
+    gen = choose_crosshatch_generator(
+        "layered", img_size, device, rng, angles=(0.0, 90.0)
+    )
+    side = dinv.physics.canvas_size(img_size)
+
+    cropped = gen.layer_fields()
+    full = gen.layer_fields(canvas=True)
+
+    assert cropped.shape == (2, img_size[-2], img_size[-1])
+    assert full.shape == (2, side, side)
+    # The default crop is exactly the centre of the canvas
+    assert torch.allclose(dinv.physics.center_crop(full, img_size), cropped)
+
+
+def test_multitext_layer_fields_canvas(device, rng):
+    """The per-text subclass honours canvas=True the same way."""
+    gen = multitext_generator(
+        device, rng, texts=("DEEPINVERSE", "TEST"), angles=(0.0, 90.0)
+    )
+    side = dinv.physics.canvas_size((1, 64, 64))
+
+    full = gen.layer_fields(canvas=True)
+
+    assert full.shape == (2, side, side)
+    assert torch.allclose(
+        dinv.physics.center_crop(full, (1, 64, 64)), gen.layer_fields()
+    )
+
+
 def test_crosshatch_as_overlay_source(device, rng):
     """Use 2, end to end: upright layers compose additively through CrosshatchTextOverlay."""
     img_size = (1, 64, 64)
     angles, amplitudes = (0.0, 90.0), (0.5, 0.3)
 
-    # angles=(0,) gives the upright text, which is what the overlay expects as a source
-    upright = [
-        choose_crosshatch_generator(
-            "layered", img_size, device, rng, text=text, angles=(0.0,)
-        ).layer_fields()[0]
-        for text in ("DEEPINVERSE", "TEST")
-    ]
-
     physics = dinv.physics.CrosshatchTextOverlay(
         img_size, angles=angles, amplitudes=amplitudes, device=device
     )
-    background = torch.rand(1, *img_size, device=device) * 0.5
-    x = torch.stack([background] + [u.expand(1, *img_size) for u in upright], dim=1)
+    side = physics.canvas
+
+    # angles=(0,) with canvas=True gives the upright text on the domain the overlay
+    # parametrizes a source on, so the generator and the operator agree exactly.
+    upright = [
+        choose_crosshatch_generator(
+            "layered", img_size, device, rng, text=text, angles=(0.0,)
+        ).layer_fields(canvas=True)[0]
+        for text in ("DEEPINVERSE", "TEST")
+    ]
+    assert all(u.shape == (side, side) for u in upright)
+
+    background = torch.rand(1, img_size[0], side, side, device=device) * 0.5
+    x = torch.stack(
+        [background] + [u.expand(1, img_size[0], side, side) for u in upright], dim=1
+    )
     y = physics.A(x)
 
     # Text is added on top, so it can only brighten, and it must change something
-    assert (y >= background - 1e-6).all()
-    assert not torch.allclose(y, background)
+    window = dinv.physics.center_crop(background, img_size)
+    assert (y >= window - 1e-6).all()
+    assert not torch.allclose(y, window)
 
 
 def multitext_generator(device, rng, **kwargs):

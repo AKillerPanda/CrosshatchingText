@@ -4,6 +4,7 @@ import torch
 import torch.nn as nn
 
 from deepinv.models.unet import UNet
+from deepinv.physics.textoverlay import center_pad
 
 
 def contrast_background(layer: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
@@ -32,7 +33,9 @@ def contrast_background(layer: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
     # Complement of the ink colour, forced to the opposite end of the luminance range.
     background = 1.0 - ink.clamp(0.0, 1.0)
     luminance = ink.clamp(0.0, 1.0).mean(dim=1, keepdim=True)
-    background = torch.where(luminance < 0.5, background.clamp_min(0.75), background.clamp_max(0.25))
+    background = torch.where(
+        luminance < 0.5, background.clamp_min(0.75), background.clamp_max(0.25)
+    )
     background = background.expand(batch, channels, 1, 1)
 
     ink_image = layer.clamp(0.0, 1.0)
@@ -47,9 +50,14 @@ class TextLayerSeparator(nn.Module):
     ``y = a + w_1 * rotate(s_1, angle_1) + ... + w_K * rotate(s_K, angle_K)``
 
     the network predicts all ``K+1`` sources at once, returning a tensor of shape
-    ``(B, K+1, C, H, W)`` whose component 0 is the background ``a`` and whose component ``k+1`` is
+    ``(B, K+1, C, S, S)`` whose component 0 is the background ``a`` and whose component ``k+1`` is
     the *upright* text of layer ``k``. With the default ``n_layers=2`` that is the three images
     of the usual crosshatch setting: the clean background, the first text, and the second.
+
+    The sources live on the operator's canvas, of side ``S = physics.canvas``, not on the image
+    grid: a layer rotated into the frame comes from beyond it, so it has to be parametrized there.
+    The measurement is zero-padded onto that canvas before the backbone sees it, which means the
+    corners the network fills in are unobserved and constrained only by the training data.
 
     A single U-Net backbone predicts every source, which lets it use the fact that the sources
     must add back up to the measurement. That constraint is then imposed exactly when
@@ -60,8 +68,8 @@ class TextLayerSeparator(nn.Module):
     :param int in_channels: number of channels of the image, e.g. 1 for grayscale or 3 for colour.
     :param int n_layers: number of text layers ``K`` to separate. The output has ``K+1``
         components.
-    :param torch.nn.Module backbone: network mapping ``(B, C, H, W)`` to
-        ``(B, (K+1)*C, H, W)``. If ``None``, a :class:`deepinv.models.UNet` is built.
+    :param torch.nn.Module backbone: size-preserving network mapping ``(B, C, S, S)`` to
+        ``(B, (K+1)*C, S, S)``. If ``None``, a :class:`deepinv.models.UNet` is built.
     :param bool nonnegative: clamp the text layers to be non-negative, since added text only ever
         brightens the background in this model.
     :param bool enforce_consistency: fold the residual back into the background so the sources
@@ -81,8 +89,8 @@ class TextLayerSeparator(nn.Module):
         >>> model = TextLayerSeparator(in_channels=1, n_layers=2)
         >>> y = torch.rand(2, 1, 32, 32)
         >>> x_hat = model(y, physics)
-        >>> x_hat.shape
-        torch.Size([2, 3, 1, 32, 32])
+        >>> x_hat.shape                     # sources on the 46x46 canvas
+        torch.Size([2, 3, 1, 46, 46])
 
         With ``enforce_consistency`` the sources add back up to the measurement:
 
@@ -123,20 +131,27 @@ class TextLayerSeparator(nn.Module):
         )
         self.to(device)
 
-    def forward(self, y: torch.Tensor, physics=None, **kwargs) -> torch.Tensor:
+    def forward(
+        self, y: torch.Tensor, physics=None, canvas: int = None, **kwargs
+    ) -> torch.Tensor:
         r"""
         Separate a measurement into its sources.
 
         :param torch.Tensor y: measurement of shape ``(B, C, H, W)``.
-        :param deepinv.physics.CrosshatchTextOverlay physics: the overlay operator. Required when
-            ``enforce_consistency`` is set, since the residual is computed through it.
-        :return: sources of shape ``(B, K+1, C, H, W)``.
+        :param deepinv.physics.CrosshatchTextOverlay physics: the overlay operator, which sets the
+            canvas the sources live on. Required unless ``canvas`` is given.
+        :param int canvas: side ``S`` of the canvas, if no ``physics`` is passed.
+        :return: sources of shape ``(B, K+1, C, S, S)``.
         :rtype: torch.Tensor
         """
-        batch, _, height, width = y.shape
+        batch = y.shape[0]
 
-        out = self.backbone(y)
-        x = out.reshape(batch, self.n_components, self.in_channels, height, width)
+        side = self._canvas(physics, canvas)
+        # The layers extend beyond the frame, so the network has to predict beyond it too.
+        padded = center_pad(y, side)
+
+        out = self.backbone(padded)
+        x = out.reshape(batch, self.n_components, self.in_channels, side, side)
 
         if self.nonnegative:
             # Added text only brightens, so the layers are non-negative; the background is free.
@@ -148,7 +163,20 @@ class TextLayerSeparator(nn.Module):
                     "physics must be passed when enforce_consistency is True, as the residual "
                     "y - A(x) is computed through the forward operator."
                 )
-            residual = y - physics.A(x)
+            # A crops, so padding the residual back puts it exactly where it was measured and
+            # leaves the unobserved corners of the background untouched.
+            residual = center_pad(y - physics.A(x), side)
             x = torch.cat([x[:, :1] + residual.unsqueeze(1), x[:, 1:]], dim=1)
 
         return x
+
+    @staticmethod
+    def _canvas(physics, canvas: int = None) -> int:
+        r"""Side of the canvas the sources live on, from the operator or given directly."""
+        if canvas is not None:
+            return canvas
+        if physics is None:
+            raise ValueError(
+                "pass either physics, whose canvas sets the size of the sources, or canvas."
+            )
+        return physics.canvas

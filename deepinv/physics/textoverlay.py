@@ -71,18 +71,96 @@ def rotate_adjoint(
     return grad
 
 
+def canvas_size(img_size: tuple[int]) -> int:
+    r"""
+    Side of the square canvas a rotated layer needs in order to cover the image.
+
+    A layer rotated about the centre of an ``(H, W)`` image only covers every pixel of it if the
+    layer itself extends to the circumscribed circle, of diameter :math:`\sqrt{2}\max(H, W)`.
+    Parametrizing a layer on the image grid instead forces it to zero in the corners it rotates
+    in from, which asserts there is no content there rather than admitting it was not observed.
+
+    This is the same canvas
+    :class:`deepinv.physics.generator.CrosshatchTextMaskGenerator` renders on, so layers taken
+    from that generator with ``canvas=True`` are exactly the sources these operators expect.
+
+    :param tuple[int] img_size: image size, of shape ``(C, H, W)`` or ``(H, W)``.
+    :return: side ``S`` of the square canvas.
+    :rtype: int
+
+    |sep|
+
+    :Examples:
+
+        >>> from deepinv.physics import canvas_size
+        >>> canvas_size((1, 32, 32))
+        46
+    """
+    height, width = img_size[-2], img_size[-1]
+    return int(2.0**0.5 * max(height, width)) + 1
+
+
+def center_crop(x: torch.Tensor, img_size: tuple[int]) -> torch.Tensor:
+    r"""
+    Crop the centre of a canvas back to the image size.
+
+    Uses the same offsets as
+    :meth:`deepinv.physics.generator.CrosshatchTextMaskGenerator.layer_fields`, so the two agree
+    pixel for pixel. The exact adjoint is :func:`deepinv.physics.center_pad`.
+
+    :param torch.Tensor x: canvas of shape ``(..., S, S)``.
+    :param tuple[int] img_size: target size, of shape ``(C, H, W)`` or ``(H, W)``.
+    :return: tensor of shape ``(..., H, W)``.
+    :rtype: torch.Tensor
+    """
+    height, width = img_size[-2], img_size[-1]
+    top = (x.shape[-2] - height) // 2
+    left = (x.shape[-1] - width) // 2
+    if top < 0 or left < 0:
+        raise ValueError(
+            f"cannot crop a {tuple(x.shape[-2:])} canvas to ({height}, {width})."
+        )
+    return x[..., top : top + height, left : left + width]
+
+
+def center_pad(y: torch.Tensor, side: int) -> torch.Tensor:
+    r"""
+    Zero-pad an image into the centre of a square canvas.
+
+    The exact adjoint of :func:`deepinv.physics.center_crop`: cropping selects a sub-block, and
+    the transpose of a selection is a zero-padding.
+
+    :param torch.Tensor y: image of shape ``(..., H, W)``.
+    :param int side: side ``S`` of the target canvas.
+    :return: tensor of shape ``(..., S, S)``.
+    :rtype: torch.Tensor
+    """
+    height, width = y.shape[-2], y.shape[-1]
+    top = (side - height) // 2
+    left = (side - width) // 2
+    if top < 0 or left < 0:
+        raise ValueError(
+            f"cannot pad a {(height, width)} image into a {side}x{side} canvas."
+        )
+    return F.pad(y, (left, side - width - left, top, side - height - top))
+
+
 class CrosshatchTextOverlay(LinearPhysics):
     r"""Additive text-overlay operator, for separating crosshatched text from an image.
 
     Models an image carrying several layers of text, each written at its own angle:
 
-    ``y = a + w_1 * rotate(s_1, angle_1) + ... + w_K * rotate(s_K, angle_K)``
+    ``y = crop( a + w_1 * rotate(s_1, angle_1) + ... + w_K * rotate(s_K, angle_K) )``
 
-    where ``a`` is the background image, ``s_k`` is the *upright* text field of layer ``k``, and
-    ``angle_k`` is the angle that layer is written at. The unknowns are stacked into a single
-    tensor ``x`` of shape ``(B, K+1, C, H, W)``, with ``x[:, 0]`` the background and
-    ``x[:, k+1]`` the upright text of layer ``k``, so the operator is linear in ``x`` and this is
-    an ordinary :class:`deepinv.physics.LinearPhysics` with one measurement and ``K+1`` sources.
+    where ``a`` is the background, ``s_k`` is the *upright* text field of layer ``k``, and
+    ``angle_k`` is the angle that layer is written at.
+
+    Every source lives on a square canvas of side ``S = canvas_size(img_size)``, wide enough that
+    a rotation still covers the whole image, and the measurement is the centre crop of their sum.
+    The unknowns are stacked into a tensor ``x`` of shape ``(B, K+1, C, S, S)``, with ``x[:, 0]``
+    the background and ``x[:, k+1]`` the upright text of layer ``k``, so the operator is linear in
+    ``x`` and this is an ordinary :class:`deepinv.physics.LinearPhysics` with one measurement and
+    ``K+1`` sources.
 
     Parametrizing the unknowns as *upright* text rather than rotated text is deliberate: it puts
     the rotation in the operator, so a reconstruction method only ever has to model horizontal
@@ -90,13 +168,16 @@ class CrosshatchTextOverlay(LinearPhysics):
 
     This is the additive counterpart of the multiplicative masks produced by
     :class:`deepinv.physics.generator.CrosshatchTextMaskGenerator`: there the text erases pixels,
-    here it is added on top of them, which is what a watermark or a caption does.
+    here it is added on top of them, which is what a watermark or a caption does. Layers taken
+    from that generator with ``canvas=True`` are exactly the sources this operator expects.
 
     .. note::
 
-        Rotation is applied in place on the ``(H, W)`` grid, so text rotated out of the frame is
-        lost and the corners it vacates are zero. The operator is therefore not exactly
-        invertible even with ``K`` known layers, which is expected for an overlay model.
+        Giving each source its own canvas rather than the image grid is what keeps the model
+        honest: a layer rotated in from beyond the frame contributes real content, and forcing it
+        to zero there would assert the page is blank rather than admit it was not observed. The
+        price is that the corners of the canvas rotate out of the window entirely, so they are
+        unobserved — an explicit null space the prior has to pin down, rather than a silent one.
 
     ``angles`` and ``amplitudes`` are registered buffers rather than fixed attributes, so they can
     be written by hand at any point with :meth:`update_parameters`, or passed to a single call as
@@ -115,14 +196,17 @@ class CrosshatchTextOverlay(LinearPhysics):
 
     :Examples:
 
-        Compose a background with two text layers at 0 and 90 degrees:
+        Compose a background with two text layers at 0 and 90 degrees. The sources live on the
+        canvas, the measurement on the image grid:
 
         >>> import torch
         >>> from deepinv.physics import CrosshatchTextOverlay
         >>> physics = CrosshatchTextOverlay((1, 32, 32), angles=(0.0, 90.0))
-        >>> x = torch.zeros(1, 3, 1, 32, 32)   # (background, layer 1, layer 2)
+        >>> physics.canvas
+        46
+        >>> x = torch.zeros(1, 3, 1, 46, 46)   # (background, layer 1, layer 2)
         >>> x[:, 0] = 0.5                      # flat grey background
-        >>> x[:, 1, :, 16] = 1.0               # a horizontal bar of "text"
+        >>> x[:, 1, :, 23] = 1.0               # a horizontal bar of "text"
         >>> y = physics(x)
         >>> y.shape
         torch.Size([1, 1, 32, 32])
@@ -193,6 +277,17 @@ class CrosshatchTextOverlay(LinearPhysics):
         r"""Number of text layers ``K``, i.e. one fewer than the number of sources."""
         return self.angles.numel()
 
+    @property
+    def canvas(self) -> int:
+        r"""Side ``S`` of the square canvas each source lives on."""
+        return canvas_size(self.img_size)
+
+    @property
+    def source_size(self) -> tuple[int]:
+        r"""Shape ``(K+1, C, S, S)`` of the sources, without batch dimension."""
+        side = self.canvas
+        return (self.n_layers + 1, self.img_size[0], side, side)
+
     def update_parameters(self, angles=None, amplitudes=None, **kwargs):
         r"""
         Set the angles, and optionally the amplitudes, of the text layers.
@@ -223,9 +318,12 @@ class CrosshatchTextOverlay(LinearPhysics):
 
     def A(self, x: torch.Tensor, **kwargs) -> torch.Tensor:
         r"""
-        Compose the background and the rotated text layers into one image.
+        Compose the background and the rotated text layers, then crop to the image.
 
-        :param torch.Tensor x: sources of shape ``(B, K+1, C, H, W)``.
+        The sum is formed on the canvas and cropped once at the end, which by linearity is the
+        same as cropping each rotated layer.
+
+        :param torch.Tensor x: sources of shape ``(B, K+1, C, S, S)``.
         :param dict kwargs: optionally ``angles`` and ``amplitudes``, to set them for this call.
         :return: image of shape ``(B, C, H, W)``.
         :rtype: torch.Tensor
@@ -237,25 +335,36 @@ class CrosshatchTextOverlay(LinearPhysics):
                 f"x must have {self.n_layers + 1} components for "
                 f"{self.n_layers} text layers, got {x.shape[1]}."
             )
+        if x.shape[-2:] != (self.canvas, self.canvas):
+            raise ValueError(
+                f"sources must live on the {self.canvas}x{self.canvas} canvas, got "
+                f"{tuple(x.shape[-2:])}. See deepinv.physics.canvas_size."
+            )
 
         y = x[:, 0]
-        for k, (angle, amplitude) in enumerate(zip(self.angles, self.amplitudes)):
+        for k, (angle, amplitude) in enumerate(
+            zip(self.angles, self.amplitudes, strict=True)
+        ):
             y = y + amplitude * rotate(x[:, k + 1], angle, mode=self.mode)
-        return y
+        return center_crop(y, self.img_size).contiguous()
 
     def A_adjoint(self, y: torch.Tensor, **kwargs) -> torch.Tensor:
         r"""
         Back-project a measurement onto each source.
 
+        The adjoint of ``crop`` is a zero-padding, so the measurement is placed back on the canvas
+        once and then back-projected through each layer's rotation.
+
         :param torch.Tensor y: image of shape ``(B, C, H, W)``.
         :param dict kwargs: optionally ``angles`` and ``amplitudes``, to set them for this call.
-        :return: sources of shape ``(B, K+1, C, H, W)``.
+        :return: sources of shape ``(B, K+1, C, S, S)``.
         :rtype: torch.Tensor
         """
         self.update_parameters(**kwargs)
 
-        components = [y] + [
-            amplitude * rotate_adjoint(y, angle, mode=self.mode)
-            for angle, amplitude in zip(self.angles, self.amplitudes)
+        padded = center_pad(y, self.canvas)
+        components = [padded] + [
+            amplitude * rotate_adjoint(padded, angle, mode=self.mode)
+            for angle, amplitude in zip(self.angles, self.amplitudes, strict=True)
         ]
         return torch.stack(components, dim=1)

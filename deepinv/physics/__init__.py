@@ -1,5 +1,17 @@
 from .inpainting import Inpainting, Demosaicing
-from .textoverlay import CrosshatchTextOverlay, rotate, rotate_adjoint
+from .textoverlay import (
+    CrosshatchTextOverlay,
+    canvas_size,
+    center_crop,
+    center_pad,
+    rotate,
+    rotate_adjoint,
+)
+from .palimpsest import (
+    PalimpsestAttenuation,
+    PalimpsestOpticalDensity,
+    estimate_substrate,
+)
 from .compressed_sensing import CompressedSensing
 from .blur import (
     Blur,
