@@ -679,7 +679,6 @@ class CrosshatchTextMaskGenerator(PhysicsGenerator):
     ``invert=True`` to keep only the text instead.
 
     .. note::
-
         Text rasterization requires `Pillow <https://pillow.readthedocs.io>`_, which is installed
         alongside ``torchvision``. If ``font_path`` is not given, Pillow's built-in font is used, so
         the exact glyph shapes depend on the installed Pillow version. Pass ``font_path`` to pin a
@@ -700,15 +699,15 @@ class CrosshatchTextMaskGenerator(PhysicsGenerator):
     :param bool invert: if ``False`` (default), glyph pixels are set to 0 and the background to 1, so
         the text is the missing region. If ``True``, only the text is kept.
     :param bool random_angles: if ``True``, ``len(angles)`` angles are sampled uniformly in
-        :math:`[0, 180)` at each step instead of using ``angles``.
+        ``[0, 180)`` at each step instead of using ``angles``.
     :param bool random_shift: if ``True``, the tiled text field is randomly translated for each
         sample in the batch, so that the batch elements differ.
     :param str, torch.device device: device where the mask is stored (default: 'cpu').
     :param torch.dtype dtype: the data type of the generated mask.
     :param torch.Generator rng: torch random number generator.
-
+    
     |sep|
-
+    
     :Examples:
 
         Generate a crosshatched text mask made of text rotated by 0, 45 and 90 degrees:
@@ -786,7 +785,7 @@ class CrosshatchTextMaskGenerator(PhysicsGenerator):
         self.invert = invert
         self.random_angles = random_angles
         self.random_shift = random_shift
-        self._tile_cache = None
+        self._tile_cache: dict[str, torch.Tensor] = {}
 
     @staticmethod
     def rotation_matrix(
@@ -797,9 +796,8 @@ class CrosshatchTextMaskGenerator(PhysicsGenerator):
         r"""
         Build the 2x2 rotation matrix of a given angle.
 
-        .. math::
-
-            R(\theta) = \begin{pmatrix} \cos\theta & -\sin\theta \\ \sin\theta & \cos\theta \end{pmatrix}
+        The matrix is ``[[cos, -sin], [sin, cos]]``, so it rotates counterclockwise in a
+        right-handed frame.
 
         :param float angle: rotation angle in degrees.
         :param str, torch.device device: device on which to build the matrix.
@@ -811,18 +809,20 @@ class CrosshatchTextMaskGenerator(PhysicsGenerator):
         cos, sin = torch.cos(theta), torch.sin(theta)
         return torch.stack([torch.stack([cos, -sin]), torch.stack([sin, cos])])
 
-    def _render_text(self) -> torch.Tensor:
+    def _render_text(self, text: str = None) -> torch.Tensor:
         r"""
-        Rasterize ``self.text`` into a binary 2D tensor using Pillow.
+        Rasterize a string into a binary 2D tensor using Pillow.
 
-        The result is cached, as it only depends on ``text``, ``font_size``, ``font_path`` and
-        ``text_spacing``, which are all fixed at construction.
+        Results are cached per string, as a tile only depends on the text and on
+        ``font_size``, ``font_path`` and ``text_spacing``, which are fixed at construction.
 
+        :param str text: string to rasterize. If ``None``, ``self.text`` is used.
         :return: tensor of shape ``(h, w)`` with values in {0, 1}, where 1 marks the glyphs.
         :rtype: torch.Tensor
         """
-        if self._tile_cache is not None:
-            return self._tile_cache
+        text = self.text if text is None else text
+        if text in self._tile_cache:
+            return self._tile_cache[text]
 
         try:
             from PIL import Image, ImageDraw, ImageFont
@@ -844,20 +844,19 @@ class CrosshatchTextMaskGenerator(PhysicsGenerator):
 
         # Measure the text before drawing it so that no glyph is clipped.
         left, top, right, bottom = ImageDraw.Draw(Image.new("L", (1, 1))).textbbox(
-            (0, 0), self.text, font=font
+            (0, 0), text, font=font
         )
         pad = self.text_spacing
-        width = max(right - left, 1) + 2 * pad
-        height = max(bottom - top, 1) + 2 * pad
+        # textbbox may return floats for TrueType fonts, but Pillow wants integer sizes.
+        width = int(max(right - left, 1)) + 2 * pad
+        height = int(max(bottom - top, 1)) + 2 * pad
 
         image = Image.new("L", (width, height), 0)
-        ImageDraw.Draw(image).text(
-            (pad - left, pad - top), self.text, fill=1, font=font
-        )
+        ImageDraw.Draw(image).text((pad - left, pad - top), text, fill=1, font=font)
 
         tile = torch.frombuffer(bytearray(image.tobytes()), dtype=torch.uint8)
-        self._tile_cache = tile.reshape(height, width).to(**self.factory_kwargs)
-        return self._tile_cache
+        self._tile_cache[text] = tile.reshape(height, width).to(**self.factory_kwargs)
+        return self._tile_cache[text]
 
     def _tile(
         self, tile: torch.Tensor, size: int, shift: tuple = (0, 0)
@@ -893,7 +892,7 @@ class CrosshatchTextMaskGenerator(PhysicsGenerator):
         r"""
         Rotate a square canvas by ``angle`` degrees about its centre.
 
-        The sampling grid is built from :math:`R(\theta)^{\top}`, since
+        The sampling grid is built from the transpose of the rotation matrix, since
         :func:`torch.nn.functional.grid_sample` maps output coordinates back to input
         coordinates.
 
@@ -994,3 +993,137 @@ class CrosshatchTextMaskGenerator(PhysicsGenerator):
 
         masks = [self.batch_step(img_size=img_size) for _ in range(batch_size)]
         return {"mask": torch.stack(masks)}
+
+
+class MultiTextCrosshatchMaskGenerator(CrosshatchTextMaskGenerator):
+    r"""Crosshatched mask whose layers each carry their own text.
+
+    Same construction as :class:`deepinv.physics.generator.CrosshatchTextMaskGenerator`, except
+    that every rotation angle gets its own string instead of repeating a single one. This lets a
+    long word run in one direction and a short one in another, e.g. ``"DEEPINVERSE"`` horizontally
+    and ``"TEST"`` vertically.
+
+    ``texts`` and ``angles`` are paired elementwise, and ``texts`` is cycled when it is shorter
+    than ``angles``, so ``texts=("A", "B")`` with four angles alternates A, B, A, B. Each string is
+    rasterized and tiled independently, so the strings may differ in length: a longer word simply
+    repeats less often across the image plane.
+
+    :param tuple[int] img_size: size of the mask without batch dimension, of shape `(C, H, W)` or `(H, W)`.
+    :param tuple[str] texts: strings to render, paired with ``angles`` and cycled if shorter.
+    :param tuple[float] angles: rotation angles in degrees, one per layer.
+    :param str mode: either ``"layered"`` (crosshatch made of rotated text) or ``"hatch"``
+        (each text stencil filled with a line grating rotated by its own angle).
+    :param kwargs: any other argument of :class:`deepinv.physics.generator.CrosshatchTextMaskGenerator`.
+
+    |sep|
+
+    :Examples:
+
+        A long word across the image and a short one down it:
+
+        >>> from deepinv.physics.generator import MultiTextCrosshatchMaskGenerator
+        >>> gen = MultiTextCrosshatchMaskGenerator(
+        ...     (1, 64, 64), texts=("DEEPINVERSE", "TEST"), angles=(0.0, 90.0)
+        ... )
+        >>> mask = gen.step(batch_size=2)["mask"]
+        >>> mask.shape
+        torch.Size([2, 1, 64, 64])
+        >>> bool(((mask == 0) | (mask == 1)).all())  # the mask is binary
+        True
+
+        Fewer strings than angles: the strings are cycled.
+
+        >>> gen = MultiTextCrosshatchMaskGenerator(
+        ...     (1, 64, 64), texts=("AB", "C"), angles=(0.0, 45.0, 90.0, 135.0)
+        ... )
+        >>> gen.texts_per_angle
+        ('AB', 'C', 'AB', 'C')
+
+        A single string reproduces the parent generator exactly.
+
+        >>> from deepinv.physics.generator import CrosshatchTextMaskGenerator
+        >>> kwargs = dict(angles=(0.0, 45.0), text_spacing=2)
+        >>> one = CrosshatchTextMaskGenerator((1, 32, 32), text="AB", **kwargs)
+        >>> many = MultiTextCrosshatchMaskGenerator((1, 32, 32), texts=("AB",), **kwargs)
+        >>> bool(torch.equal(one.step()["mask"], many.step()["mask"]))
+        True
+    """
+
+    def __init__(
+        self,
+        img_size: tuple[int],
+        texts: tuple[str] = ("DEEPINVERSE", "TEST"),
+        angles: tuple[float] = (0.0, 90.0),
+        **kwargs,
+    ):
+        if len(texts) == 0:
+            raise ValueError("At least one text must be given.")
+
+        # The parent keeps a single ``text``; use the first one so its own helpers stay usable.
+        super().__init__(img_size, text=texts[0], angles=angles, **kwargs)
+        self.texts = tuple(texts)
+
+    @property
+    def texts_per_angle(self) -> tuple:
+        r"""
+        The string used by each layer, i.e. ``texts`` cycled to the length of ``angles``.
+
+        :return: tuple of strings, of the same length as ``angles``.
+        :rtype: tuple
+        """
+        return tuple(
+            self.texts[k % len(self.texts)] for k in range(len(self.angles))
+        )
+
+    def batch_step(self, img_size: tuple | None = None) -> torch.Tensor:
+        r"""
+        Create one crosshatched mask whose layers carry different texts, without batch dimension.
+
+        :param tuple img_size: if not ``None``, generate a mask of this 2D shape and override the
+            ``img_size`` attribute, must be of form `(H, W)`.
+        :return: mask of shape given either by ``img_size`` or the class attribute ``img_size``.
+        :rtype: torch.Tensor
+        """
+        size = self.img_size if img_size is None else self.img_size[:-2] + img_size[-2:]
+        height, width = size[-2], size[-1]
+
+        # Canvas large enough that any rotation still covers the whole image.
+        side = int(2.0**0.5 * max(height, width)) + 1
+
+        if self.random_angles:
+            angles = (
+                torch.rand(len(self.angles), generator=self.rng, **self.factory_kwargs)
+                * 180.0
+            ).tolist()
+        else:
+            angles = self.angles
+
+        shift = (0, 0)
+        if self.random_shift:
+            shift = tuple(
+                torch.randint(
+                    0, side, (2,), generator=self.rng, device=self.device
+                ).tolist()
+            )
+
+        # Each layer is tiled from its own text, so the strings may have different lengths.
+        layers = []
+        for text, angle in zip(self.texts_per_angle, angles):
+            text_field = self._tile(self._render_text(text), side, shift=shift)
+            if self.mode == "layered":
+                layers.append(self._rotate(text_field, angle))
+            else:
+                layers.append(text_field * self._rotate(self._grating(side), angle))
+        field = torch.stack(layers).amax(dim=0)
+
+        # Centre crop the canvas back to the image size.
+        top = (side - height) // 2
+        left = (side - width) // 2
+        field = field[top : top + height, left : left + width]
+
+        mask = field if self.invert else 1.0 - field
+
+        if len(size) == 3:
+            mask = mask.expand(size[0], height, width)
+
+        return mask.contiguous()

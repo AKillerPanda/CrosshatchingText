@@ -25,6 +25,7 @@ from .inpainting import (
     Phase2PhaseSplittingMaskGenerator,
     MultiplicativeSplittingMaskGenerator,
     CrosshatchTextMaskGenerator,
+    MultiTextCrosshatchMaskGenerator,
 )
 from .downsampling import DownsamplingGenerator
 from .zernike import Zernike

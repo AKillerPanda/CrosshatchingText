@@ -56,7 +56,13 @@ INPAINTING_IMG_SIZES = [
 INPAINTING_GENERATORS = ["bernoulli", "gaussian", "multiplicative"]
 
 # Crosshatched Text Generators
-CROSSHATCH_GENERATORS = ["layered", "hatch", "random_shift", "random_angles"]
+CROSSHATCH_GENERATORS = [
+    "layered",
+    "hatch",
+    "random_shift",
+    "random_angles",
+    "multitext",
+]
 CROSSHATCH_IMG_SIZES = [(64, 40), (1, 64, 40), (3, 32, 32)]  # (H,W), (C,H,W)
 
 DTYPES = [torch.float32, torch.float64]
@@ -572,6 +578,15 @@ def choose_crosshatch_generator(
             random_angles=True,
             **kwargs,
         )
+    elif generator_name == "multitext":
+        # Same text on both layers, so the generic text assertions still hold; the
+        # per-layer texts are exercised by the dedicated tests below.
+        kwargs.pop("text")
+        return dinv.physics.generator.MultiTextCrosshatchMaskGenerator(
+            texts=(text, text),
+            angles=(0.0, 90.0),
+            **kwargs,
+        )
     else:
         raise Exception("The generator chosen doesn't exist")
 
@@ -752,6 +767,92 @@ def test_crosshatch_inpainting(generator_name, batch_size, device, rng):
 
     assert y.shape == x.shape
     assert torch.equal(y, x * params["mask"])
+
+
+def multitext_generator(device, rng, **kwargs):
+    """Build a MultiTextCrosshatchMaskGenerator with defaults shared by the tests below."""
+    kwargs.setdefault("img_size", (1, 64, 64))
+    return dinv.physics.generator.MultiTextCrosshatchMaskGenerator(
+        device=device, rng=rng, **kwargs
+    )
+
+
+@pytest.mark.parametrize(
+    "texts, angles, expected",
+    [
+        (("DEEPINVERSE", "TEST"), (0.0, 90.0), ("DEEPINVERSE", "TEST")),
+        (("AB", "C"), (0.0, 45.0, 90.0, 135.0), ("AB", "C", "AB", "C")),
+        (("ONLY",), (0.0, 45.0), ("ONLY", "ONLY")),
+    ],
+)
+def test_multitext_pairing(texts, angles, expected, device, rng):
+    """``texts`` is paired with ``angles`` elementwise and cycled when shorter."""
+    gen = multitext_generator(device, rng, texts=texts, angles=angles)
+
+    assert gen.texts_per_angle == expected
+    assert len(gen.texts_per_angle) == len(gen.angles)
+
+
+def test_multitext_matches_parent_for_one_text(device, rng):
+    """With a single string the subclass reproduces the parent generator exactly."""
+    img_size = (1, 64, 64)
+    kwargs = dict(angles=(0.0, 45.0, 90.0))
+
+    parent = dinv.physics.generator.CrosshatchTextMaskGenerator(
+        img_size, text="DEEPINV", device=device, rng=rng, **kwargs
+    ).step(batch_size=1, seed=0)["mask"]
+    child = multitext_generator(
+        device, rng, img_size=img_size, texts=("DEEPINV",), **kwargs
+    ).step(batch_size=1, seed=0)["mask"]
+
+    assert torch.equal(parent, child)
+
+
+@pytest.mark.parametrize("mode", ("layered", "hatch"))
+def test_multitext_layers_differ_by_text(mode, device, rng):
+    """Changing only the second string changes the mask, so each layer uses its own text."""
+    kwargs = dict(angles=(0.0, 90.0), mode=mode)
+
+    a = multitext_generator(device, rng, texts=("DEEPINVERSE", "TEST"), **kwargs).step(
+        batch_size=1, seed=0
+    )["mask"]
+    b = multitext_generator(device, rng, texts=("DEEPINVERSE", "OTHER"), **kwargs).step(
+        batch_size=1, seed=0
+    )["mask"]
+
+    assert not torch.equal(a, b)
+    assert torch.all((a == 0) | (a == 1))
+    assert 0 < (a == 0).sum() < a.numel()
+
+
+def test_multitext_text_lengths(device, rng):
+    """Strings of very different lengths tile independently and both leave their mark."""
+    # A blank second layer must remove strictly less than a rendered one
+    blank = multitext_generator(
+        device, rng, texts=("DEEPINVERSE", " "), angles=(0.0, 90.0)
+    ).step(batch_size=1, seed=0)["mask"]
+    short = multitext_generator(
+        device, rng, texts=("DEEPINVERSE", "I"), angles=(0.0, 90.0)
+    ).step(batch_size=1, seed=0)["mask"]
+    long = multitext_generator(
+        device, rng, texts=("DEEPINVERSE", "TESTING123"), angles=(0.0, 90.0)
+    ).step(batch_size=1, seed=0)["mask"]
+
+    # More text in the second layer removes more pixels
+    assert (blank == 0).sum() < (short == 0).sum() < (long == 0).sum()
+
+
+def test_multitext_generator_errors(device, rng):
+    # At least one text is needed
+    with pytest.raises(ValueError):
+        multitext_generator(device, rng, texts=())
+
+    # Parent validation still applies
+    with pytest.raises(ValueError):
+        multitext_generator(device, rng, mode="hatched")
+
+    with pytest.raises(ValueError):
+        multitext_generator(device, rng, angles=())
 
 
 @pytest.mark.parametrize("num_channels", NUM_CHANNELS)
