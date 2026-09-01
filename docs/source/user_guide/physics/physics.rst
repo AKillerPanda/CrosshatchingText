@@ -29,6 +29,7 @@ This is particular useful when dealing with blind inverse problems or parameter 
      -
        | :class:`deepinv.physics.Denoising`
        | :class:`deepinv.physics.Inpainting`
+       | :class:`deepinv.physics.CrosshatchTextOverlay`
        | :class:`deepinv.physics.Demosaicing`
        | :class:`deepinv.physics.Decolorize`
        | :class:`deepinv.physics.SpatialUnwrapping`

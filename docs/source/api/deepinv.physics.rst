@@ -37,6 +37,7 @@ Operators
 
    deepinv.physics.Denoising
    deepinv.physics.Inpainting
+   deepinv.physics.CrosshatchTextOverlay
    deepinv.physics.Decolorize
    deepinv.physics.Demosaicing
    deepinv.physics.Blur

@@ -51,6 +51,7 @@ Deep Architectures
 
    deepinv.models.AutoEncoder
    deepinv.models.UNet
+   deepinv.models.TextLayerSeparator
    deepinv.models.DnCNN
    deepinv.models.DRUNet
    deepinv.models.SCUNet

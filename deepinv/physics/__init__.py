@@ -1,4 +1,5 @@
 from .inpainting import Inpainting, Demosaicing
+from .textoverlay import CrosshatchTextOverlay, rotate, rotate_adjoint
 from .compressed_sensing import CompressedSensing
 from .blur import (
     Blur,

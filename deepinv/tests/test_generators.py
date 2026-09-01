@@ -55,7 +55,11 @@ INPAINTING_IMG_SIZES = [
 ]  # (C,H,W), (C,M), (C,T,H,W)
 INPAINTING_GENERATORS = ["bernoulli", "gaussian", "multiplicative"]
 
-# Crosshatched Text Generators
+# Crosshatched Text Generators.
+# Unlike the splitting generators above, these are not random subsampling masks with a
+# split ratio: they render structured text. They feed two different problems -- step()
+# gives an occlusion mask for Inpainting, layer_fields() gives the individual text
+# sources for the additive CrosshatchTextOverlay separation model.
 CROSSHATCH_GENERATORS = [
     "layered",
     "hatch",
@@ -554,38 +558,32 @@ def test_inpainting_generators(
 def choose_crosshatch_generator(
     generator_name, img_size, device, rng, dtype=torch.float32, text="DEEPINV", **kwargs
 ):
-    """Build the crosshatched text generator variant named ``generator_name``."""
-    kwargs.update(img_size=img_size, text=text, device=device, dtype=dtype, rng=rng)
+    """Build the crosshatched text generator variant named ``generator_name``.
+
+    Variant defaults are applied with ``setdefault``, so any of them can be overridden by the
+    caller, e.g. ``choose_crosshatch_generator("layered", ..., angles=(0.0, 90.0))``.
+    """
+    kwargs.update(img_size=img_size, device=device, dtype=dtype, rng=rng)
     if generator_name == "layered":
-        return dinv.physics.generator.CrosshatchTextMaskGenerator(
-            mode="layered",
-            angles=(0.0, 45.0, 90.0),
-            **kwargs,
-        )
+        kwargs.setdefault("mode", "layered")
+        kwargs.setdefault("angles", (0.0, 45.0, 90.0))
+        return dinv.physics.generator.CrosshatchTextMaskGenerator(text=text, **kwargs)
     elif generator_name == "hatch":
-        return dinv.physics.generator.CrosshatchTextMaskGenerator(
-            mode="hatch",
-            angles=(45.0, 135.0),
-            **kwargs,
-        )
+        kwargs.setdefault("mode", "hatch")
+        kwargs.setdefault("angles", (45.0, 135.0))
+        return dinv.physics.generator.CrosshatchTextMaskGenerator(text=text, **kwargs)
     elif generator_name == "random_shift":
-        return dinv.physics.generator.CrosshatchTextMaskGenerator(
-            random_shift=True,
-            **kwargs,
-        )
+        kwargs.setdefault("random_shift", True)
+        return dinv.physics.generator.CrosshatchTextMaskGenerator(text=text, **kwargs)
     elif generator_name == "random_angles":
-        return dinv.physics.generator.CrosshatchTextMaskGenerator(
-            random_angles=True,
-            **kwargs,
-        )
+        kwargs.setdefault("random_angles", True)
+        return dinv.physics.generator.CrosshatchTextMaskGenerator(text=text, **kwargs)
     elif generator_name == "multitext":
         # Same text on both layers, so the generic text assertions still hold; the
         # per-layer texts are exercised by the dedicated tests below.
-        kwargs.pop("text")
+        kwargs.setdefault("angles", (0.0, 90.0))
         return dinv.physics.generator.MultiTextCrosshatchMaskGenerator(
-            texts=(text, text),
-            angles=(0.0, 90.0),
-            **kwargs,
+            texts=(text, text), **kwargs
         )
     else:
         raise Exception("The generator chosen doesn't exist")
@@ -755,8 +753,8 @@ def test_crosshatch_generator_errors(device, rng):
 
 
 @pytest.mark.parametrize("generator_name", CROSSHATCH_GENERATORS)
-def test_crosshatch_inpainting(generator_name, batch_size, device, rng):
-    """The mask can be fed straight to Inpainting to build a text-removal problem."""
+def test_crosshatch_as_occlusion_mask(generator_name, batch_size, device, rng):
+    """Use 1: step() is an occlusion mask, so it drops straight into Inpainting."""
     img_size = (1, 32, 32)
     gen = choose_crosshatch_generator(generator_name, img_size, device, rng)
     physics = dinv.physics.Inpainting(img_size, device=device)
@@ -767,6 +765,81 @@ def test_crosshatch_inpainting(generator_name, batch_size, device, rng):
 
     assert y.shape == x.shape
     assert torch.equal(y, x * params["mask"])
+
+
+@pytest.mark.parametrize("generator_name", CROSSHATCH_GENERATORS)
+@pytest.mark.parametrize("img_size", CROSSHATCH_IMG_SIZES)
+def test_crosshatch_layer_fields(generator_name, img_size, device, rng):
+    """Use 2: layer_fields() exposes the text sources that step() collapses together."""
+    gen = choose_crosshatch_generator(generator_name, img_size, device, rng)
+
+    gen.rng_manual_seed(0)
+    layers = gen.layer_fields()
+
+    # One layer per angle, spatial only -- no channel or batch dimension
+    assert layers.shape == (len(gen.angles), *img_size[-2:])
+    assert torch.all((layers == 0) | (layers == 1))
+
+    # Every layer carries text; none is empty or completely filled
+    for k in range(layers.shape[0]):
+        assert 0 < layers[k].sum() < layers[k].numel()
+
+
+@pytest.mark.parametrize("generator_name", CROSSHATCH_GENERATORS)
+def test_crosshatch_mask_is_the_union_of_the_layers(generator_name, device, rng):
+    """The two uses agree: the mask is exactly the complement of the layers' union."""
+    img_size = (1, 64, 64)
+    gen = choose_crosshatch_generator(generator_name, img_size, device, rng)
+
+    gen.rng_manual_seed(0)
+    layers = gen.layer_fields()
+
+    gen.rng_manual_seed(0)
+    mask = gen.batch_step()
+
+    assert torch.equal(mask, (1.0 - layers.amax(dim=0)).expand(*img_size))
+
+
+def test_crosshatch_layer_fields_adapts_to_img_size(device, rng):
+    gen = choose_crosshatch_generator("layered", (1, 64, 64), device, rng)
+
+    assert gen.layer_fields(img_size=(37, 29)).shape == (len(gen.angles), 37, 29)
+
+
+def test_crosshatch_layers_differ_between_angles(device, rng):
+    """Distinct angles must give distinct layers, otherwise there is nothing to separate."""
+    gen = choose_crosshatch_generator(
+        "layered", (1, 64, 64), device, rng, angles=(0.0, 90.0)
+    )
+    gen.rng_manual_seed(0)
+    layers = gen.layer_fields()
+
+    assert not torch.equal(layers[0], layers[1])
+
+
+def test_crosshatch_as_overlay_source(device, rng):
+    """Use 2, end to end: upright layers compose additively through CrosshatchTextOverlay."""
+    img_size = (1, 64, 64)
+    angles, amplitudes = (0.0, 90.0), (0.5, 0.3)
+
+    # angles=(0,) gives the upright text, which is what the overlay expects as a source
+    upright = [
+        choose_crosshatch_generator(
+            "layered", img_size, device, rng, text=text, angles=(0.0,)
+        ).layer_fields()[0]
+        for text in ("DEEPINVERSE", "TEST")
+    ]
+
+    physics = dinv.physics.CrosshatchTextOverlay(
+        img_size, angles=angles, amplitudes=amplitudes, device=device
+    )
+    background = torch.rand(1, *img_size, device=device) * 0.5
+    x = torch.stack([background] + [u.expand(1, *img_size) for u in upright], dim=1)
+    y = physics.A(x)
+
+    # Text is added on top, so it can only brighten, and it must change something
+    assert (y >= background - 1e-6).all()
+    assert not torch.allclose(y, background)
 
 
 def multitext_generator(device, rng, **kwargs):

@@ -32,6 +32,7 @@ from .varnet import VarNet
 from .modl import MoDL
 from .multispectral import PanNet
 from .unet import UNet
+from .text_separation import TextLayerSeparator, contrast_background
 from .ncsnpp import NCSNpp
 from .guided_diffusion import ADMUNet
 from .precond import EDMPrecond

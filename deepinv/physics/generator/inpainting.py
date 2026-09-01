@@ -912,13 +912,19 @@ class CrosshatchTextMaskGenerator(PhysicsGenerator):
         )
         return rotated[0, 0]
 
-    def batch_step(self, img_size: tuple | None = None) -> torch.Tensor:
+    def layer_fields(self, img_size: tuple | None = None) -> torch.Tensor:
         r"""
-        Create one crosshatched text mask, without batch dimension.
+        Return the individual text layers, before they are combined into a single mask.
 
-        :param tuple img_size: if not ``None``, generate a mask of this 2D shape and override the
-            ``img_size`` attribute, must be of form `(H, W)`.
-        :return: mask of shape given either by ``img_size`` or the class attribute ``img_size``.
+        Layer ``k`` is the text field rotated by ``angles[k]`` (``mode="layered"``), or the
+        unrotated text stencil filled with the grating rotated by ``angles[k]``
+        (``mode="hatch"``). :meth:`batch_step` is the pixelwise maximum of these layers.
+        Useful to build a separation problem, where each layer is a source to recover.
+
+        :param tuple img_size: if not ``None``, generate layers of this 2D shape and override
+            the ``img_size`` attribute, must be of form `(H, W)`.
+        :return: tensor of shape ``(len(angles), H, W)`` with values in {0, 1}, where 1 marks
+            the glyphs of that layer.
         :rtype: torch.Tensor
         """
         size = self.img_size if img_size is None else self.img_size[:-2] + img_size[-2:]
@@ -948,16 +954,33 @@ class CrosshatchTextMaskGenerator(PhysicsGenerator):
 
         if self.mode == "layered":
             layers = [self._rotate(text_field, angle) for angle in angles]
-            field = torch.stack(layers).amax(dim=0)
         else:
-            grating = self._grating(side)
-            hatch = torch.stack([self._rotate(grating, a) for a in angles]).amax(dim=0)
-            field = text_field * hatch
+            layers = [
+                text_field * self._rotate(self._grating(side), angle)
+                for angle in angles
+            ]
 
-        # Centre crop the canvas back to the image size.
+        # Centre crop each layer back to the image size.
         top = (side - height) // 2
         left = (side - width) // 2
-        field = field[top : top + height, left : left + width]
+        return torch.stack(layers)[
+            :, top : top + height, left : left + width
+        ].contiguous()
+
+    def batch_step(self, img_size: tuple | None = None) -> torch.Tensor:
+        r"""
+        Create one crosshatched text mask, without batch dimension.
+
+        :param tuple img_size: if not ``None``, generate a mask of this 2D shape and override the
+            ``img_size`` attribute, must be of form `(H, W)`.
+        :return: mask of shape given either by ``img_size`` or the class attribute ``img_size``.
+        :rtype: torch.Tensor
+        """
+        size = self.img_size if img_size is None else self.img_size[:-2] + img_size[-2:]
+        height, width = size[-2], size[-1]
+
+        # A pixel is crosshatched as soon as one layer covers it.
+        field = self.layer_fields(img_size=img_size).amax(dim=0)
 
         mask = field if self.invert else 1.0 - field
 
@@ -1075,13 +1098,16 @@ class MultiTextCrosshatchMaskGenerator(CrosshatchTextMaskGenerator):
             self.texts[k % len(self.texts)] for k in range(len(self.angles))
         )
 
-    def batch_step(self, img_size: tuple | None = None) -> torch.Tensor:
+    def layer_fields(self, img_size: tuple | None = None) -> torch.Tensor:
         r"""
-        Create one crosshatched mask whose layers carry different texts, without batch dimension.
+        Return the individual text layers, one per angle, each with its own text.
 
-        :param tuple img_size: if not ``None``, generate a mask of this 2D shape and override the
-            ``img_size`` attribute, must be of form `(H, W)`.
-        :return: mask of shape given either by ``img_size`` or the class attribute ``img_size``.
+        Same as :meth:`deepinv.physics.generator.CrosshatchTextMaskGenerator.layer_fields`,
+        except layer ``k`` is tiled from ``texts_per_angle[k]`` instead of a single string.
+
+        :param tuple img_size: if not ``None``, generate layers of this 2D shape and override
+            the ``img_size`` attribute, must be of form `(H, W)`.
+        :return: tensor of shape ``(len(angles), H, W)`` with values in {0, 1}.
         :rtype: torch.Tensor
         """
         size = self.img_size if img_size is None else self.img_size[:-2] + img_size[-2:]
@@ -1114,16 +1140,10 @@ class MultiTextCrosshatchMaskGenerator(CrosshatchTextMaskGenerator):
                 layers.append(self._rotate(text_field, angle))
             else:
                 layers.append(text_field * self._rotate(self._grating(side), angle))
-        field = torch.stack(layers).amax(dim=0)
 
-        # Centre crop the canvas back to the image size.
+        # Centre crop each layer back to the image size.
         top = (side - height) // 2
         left = (side - width) // 2
-        field = field[top : top + height, left : left + width]
-
-        mask = field if self.invert else 1.0 - field
-
-        if len(size) == 3:
-            mask = mask.expand(size[0], height, width)
-
-        return mask.contiguous()
+        return torch.stack(layers)[
+            :, top : top + height, left : left + width
+        ].contiguous()
