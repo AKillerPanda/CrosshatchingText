@@ -55,6 +55,10 @@ INPAINTING_IMG_SIZES = [
 ]  # (C,H,W), (C,M), (C,T,H,W)
 INPAINTING_GENERATORS = ["bernoulli", "gaussian", "multiplicative"]
 
+# Crosshatched Text Generators
+CROSSHATCH_GENERATORS = ["layered", "hatch", "random_shift", "random_angles"]
+CROSSHATCH_IMG_SIZES = [(64, 40), (1, 64, 40), (3, 32, 32)]  # (H,W), (C,H,W)
+
 DTYPES = [torch.float32, torch.float64]
 
 
@@ -539,6 +543,215 @@ def test_inpainting_generators(
     # Raise error if input_mask and img_size both passed
     with pytest.raises(ValueError):
         gen.step(img_size=(20, 20), input_mask=(2, 20, 20))
+
+
+def choose_crosshatch_generator(
+    generator_name, img_size, device, rng, dtype=torch.float32, text="DEEPINV", **kwargs
+):
+    """Build the crosshatched text generator variant named ``generator_name``."""
+    kwargs.update(img_size=img_size, text=text, device=device, dtype=dtype, rng=rng)
+    if generator_name == "layered":
+        return dinv.physics.generator.CrosshatchTextMaskGenerator(
+            mode="layered",
+            angles=(0.0, 45.0, 90.0),
+            **kwargs,
+        )
+    elif generator_name == "hatch":
+        return dinv.physics.generator.CrosshatchTextMaskGenerator(
+            mode="hatch",
+            angles=(45.0, 135.0),
+            **kwargs,
+        )
+    elif generator_name == "random_shift":
+        return dinv.physics.generator.CrosshatchTextMaskGenerator(
+            random_shift=True,
+            **kwargs,
+        )
+    elif generator_name == "random_angles":
+        return dinv.physics.generator.CrosshatchTextMaskGenerator(
+            random_angles=True,
+            **kwargs,
+        )
+    else:
+        raise Exception("The generator chosen doesn't exist")
+
+
+@pytest.mark.parametrize("generator_name", CROSSHATCH_GENERATORS)
+@pytest.mark.parametrize("img_size", CROSSHATCH_IMG_SIZES)
+@pytest.mark.parametrize("dtype", DTYPES)
+def test_crosshatch_generators(
+    generator_name, img_size, dtype, batch_size, device, rng
+):
+    gen = choose_crosshatch_generator(
+        generator_name, img_size, device, rng, dtype=dtype
+    )  # Assume generator always receives "correct" img_size i.e. not one with dims missing
+
+    def correct_mask(mask, shape):
+        assert tuple(mask.shape) == tuple(shape)
+        assert mask.dtype == dtype
+        assert mask.device.type == device.type
+        # Mask is binary
+        assert torch.all((mask == 0) | (mask == 1))
+        # Text is rendered: it removes some pixels, but neither none nor all of them
+        assert 0 < (mask == 0).sum() < mask.numel()
+
+    # Standard generate mask
+    mask1 = gen.step(batch_size=batch_size, seed=0)["mask"]
+    correct_mask(mask1, (batch_size, *img_size))
+
+    # Every channel of a sample carries the same text
+    if len(img_size) == 3:
+        assert torch.all(mask1 == mask1[:, :1])
+
+    # Same seed, same masks
+    mask2 = gen.step(batch_size=batch_size, seed=0)["mask"]
+    assert torch.equal(mask1, mask2)
+
+    # Deterministic variants repeat the same mask across the batch
+    if generator_name not in ("random_shift", "random_angles"):
+        assert torch.all(mask1 == mask1[:1])
+
+    # Standard without batch dim
+    correct_mask(gen.step(batch_size=None, seed=0)["mask"], img_size)
+
+    # Adapt to new img sizes
+    correct_mask(
+        gen.step(batch_size=batch_size, img_size=(37, 29))["mask"],
+        (batch_size, *img_size[:-2], 37, 29),
+    )
+
+
+@pytest.mark.parametrize("generator_name", ("random_shift", "random_angles"))
+def test_crosshatch_batch_randomness(generator_name, device, rng):
+    """``random_shift`` and ``random_angles`` decorrelate the samples of a batch."""
+    # A batch of 4, so that a coincidental repeat cannot pass for correct behaviour
+    gen = choose_crosshatch_generator(generator_name, (1, 64, 64), device, rng)
+    mask = gen.step(batch_size=4, seed=0)["mask"]
+
+    assert not torch.all(mask == mask[:1])
+    # Same seed, same batch
+    assert torch.equal(mask, gen.step(batch_size=4, seed=0)["mask"])
+
+
+@pytest.mark.parametrize("generator_name", CROSSHATCH_GENERATORS)
+def test_crosshatch_text_is_rendered(generator_name, device, rng):
+    """The rendered glyphs, and only them, drive the mask."""
+
+    def mask_of(text):
+        gen = choose_crosshatch_generator(
+            generator_name, (1, 64, 64), device, rng, text=text
+        )
+        return gen.step(batch_size=1, seed=0)["mask"]
+
+    # The same text always gives the same mask
+    assert torch.equal(mask_of("DEEPINV"), mask_of("DEEPINV"))
+
+    # A different text gives a different mask
+    assert not torch.equal(mask_of("DEEPINV"), mask_of("IIII"))
+
+    # A blank text removes nothing
+    assert torch.all(mask_of(" ") == 1)
+
+
+@pytest.mark.parametrize("generator_name", CROSSHATCH_GENERATORS)
+def test_crosshatch_invert(generator_name, device, rng):
+    """``invert`` swaps the glyphs and the background."""
+    img_size = (1, 64, 64)
+    removed = choose_crosshatch_generator(generator_name, img_size, device, rng).step(
+        batch_size=1, seed=0
+    )["mask"]
+    kept = choose_crosshatch_generator(
+        generator_name, img_size, device, rng, invert=True
+    ).step(batch_size=1, seed=0)["mask"]
+
+    # By default the text is the missing region, so the mask is 0 on the glyphs
+    assert torch.equal(kept, 1.0 - removed)
+    assert 0 < kept.sum() < kept.numel()
+
+
+def test_crosshatch_hatch_confined_to_glyphs(device, rng):
+    """In ``hatch`` mode the gratings never leave the glyphs of the unrotated text."""
+    img_size = (1, 64, 64)
+    text = dinv.physics.generator.CrosshatchTextMaskGenerator(
+        img_size, angles=(0.0,), invert=True, device=device, rng=rng
+    ).step(batch_size=1, seed=0)["mask"]
+    hatch = choose_crosshatch_generator(
+        "hatch", img_size, device, rng, invert=True
+    ).step(batch_size=1, seed=0)["mask"]
+
+    assert torch.all(hatch <= text)
+    # The gratings carve the glyphs up rather than leaving them untouched
+    assert 0 < hatch.sum() < text.sum()
+
+
+@pytest.mark.parametrize("font_size", (None, 20))
+def test_crosshatch_font_size(font_size, device, rng):
+    """Rasterization stays binary and non-empty for bitmap and TrueType fonts."""
+    gen = choose_crosshatch_generator(
+        "layered", (1, 96, 96), device, rng, font_size=font_size
+    )
+    mask = gen.step(batch_size=1, seed=0)["mask"]
+
+    assert torch.all((mask == 0) | (mask == 1))
+    assert 0 < (mask == 0).sum() < mask.numel()
+
+
+@pytest.mark.parametrize("angle", (0.0, 30.0, 45.0, 90.0, 180.0))
+def test_crosshatch_rotation_matrix(angle, device):
+    R = dinv.physics.generator.CrosshatchTextMaskGenerator.rotation_matrix(
+        angle, device=device
+    )
+    eye = torch.eye(2, device=device)
+
+    assert tuple(R.shape) == (2, 2)
+    # Rotations are orthogonal with unit determinant
+    assert torch.allclose(R @ R.T, eye, atol=1e-6)
+    assert torch.allclose(R[0, 0] * R[1, 1] - R[0, 1] * R[1, 0], eye[0, 0], atol=1e-6)
+
+    # Rotating back by the opposite angle is the identity
+    R_inv = dinv.physics.generator.CrosshatchTextMaskGenerator.rotation_matrix(
+        -angle, device=device
+    )
+    assert torch.allclose(R @ R_inv, eye, atol=1e-6)
+
+
+def test_crosshatch_generator_errors(device, rng):
+    def build(**kwargs):
+        kwargs.setdefault("img_size", (1, 64, 64))
+        return dinv.physics.generator.CrosshatchTextMaskGenerator(
+            device=device, rng=rng, **kwargs
+        )
+
+    # Unknown mode
+    with pytest.raises(ValueError):
+        build(mode="hatched")
+
+    # img_size must be of shape (C, H, W) or (H, W)
+    with pytest.raises(ValueError):
+        build(img_size=(2, 1, 64, 64))
+
+    # At least one angle is needed
+    with pytest.raises(ValueError):
+        build(angles=())
+
+    # Unknown generator name
+    with pytest.raises(Exception):
+        choose_crosshatch_generator("bernoulli", (1, 64, 64), device, rng)
+
+
+@pytest.mark.parametrize("generator_name", CROSSHATCH_GENERATORS)
+def test_crosshatch_inpainting(generator_name, batch_size, device, rng):
+    """The mask can be fed straight to Inpainting to build a text-removal problem."""
+    img_size = (1, 32, 32)
+    gen = choose_crosshatch_generator(generator_name, img_size, device, rng)
+    physics = dinv.physics.Inpainting(img_size, device=device)
+
+    x = torch.randn(batch_size, *img_size, device=device)
+    params = gen.step(batch_size=batch_size, seed=0)
+    y = physics(x, **params)
+
+    assert y.shape == x.shape
+    assert torch.equal(y, x * params["mask"])
 
 
 @pytest.mark.parametrize("num_channels", NUM_CHANNELS)

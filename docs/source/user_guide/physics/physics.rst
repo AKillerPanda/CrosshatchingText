@@ -38,6 +38,7 @@ This is particular useful when dealing with blind inverse problems or parameter 
        | :class:`MultiplicativeSplittingMaskGenerator <deepinv.physics.generator.MultiplicativeSplittingMaskGenerator>`
        | :class:`Phase2PhaseSplittingMaskGenerator <deepinv.physics.generator.Phase2PhaseSplittingMaskGenerator>`
        | :class:`Artifact2ArtifactSplittingMaskGenerator <deepinv.physics.generator.Artifact2ArtifactSplittingMaskGenerator>`
+       | :class:`CrosshatchTextMaskGenerator <deepinv.physics.generator.CrosshatchTextMaskGenerator>`
 
    * - Blur & Super-Resolution
      -

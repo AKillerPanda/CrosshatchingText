@@ -2,6 +2,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 from warnings import warn
 import torch
+import torch.nn.functional as F
 from deepinv.physics.generator.base import PhysicsGenerator
 from deepinv.physics.functional.rand import random_choice
 
@@ -650,3 +651,346 @@ class Artifact2ArtifactSplittingMaskGenerator(Phase2PhaseSplittingMaskGenerator)
             :, split_size * idx : split_size * (idx + 1)
         ]
         return mask_out
+
+
+class CrosshatchTextMaskGenerator(PhysicsGenerator):
+    r"""Generator for crosshatched text inpainting masks.
+
+    Renders a line of text, tiles it over the image plane, and overlays several copies of the
+    tiled field rotated by a set of angles. The result is a crosshatch pattern made of text,
+    mimicking the text-overlay degradation used in text-removal inpainting benchmarks.
+
+    Each copy is rotated about the image centre and the copies are combined by a pixelwise
+    maximum, so a pixel belongs to the crosshatch as soon as it is covered by the text in at
+    least one of the rotated copies. The rotation is applied with
+    :func:`torch.nn.functional.grid_sample` on a square canvas of side
+    ``int(sqrt(2) * max(H, W)) + 1``, large enough that no corner of the image is left
+    uncovered by any rotation.
+
+    Two modes are available:
+
+    - ``mode="layered"`` (default): the crosshatch is built from the rotated text itself, i.e. the
+      strokes of the hatch *are* the glyphs.
+    - ``mode="hatch"``: the unrotated tiled text acts as a stencil which is filled with straight
+      line gratings rotated by each angle, i.e. classic crosshatch shading confined to the glyphs.
+
+    By default the text is *removed*, that is the mask is 0 on the glyphs and 1 elsewhere, which is
+    the usual setup for text-removal inpainting with :class:`deepinv.physics.Inpainting`. Set
+    ``invert=True`` to keep only the text instead.
+
+    .. note::
+
+        Text rasterization requires `Pillow <https://pillow.readthedocs.io>`_, which is installed
+        alongside ``torchvision``. If ``font_path`` is not given, Pillow's built-in font is used, so
+        the exact glyph shapes depend on the installed Pillow version. Pass ``font_path`` to pin a
+        specific TrueType font for reproducible glyphs across machines.
+
+    :param tuple[int] img_size: size of the mask without batch dimension, of shape `(C, H, W)` or `(H, W)`.
+    :param str text: text to render into the mask.
+    :param tuple[float] angles: rotation angles in degrees applied to the text (``mode="layered"``)
+        or to the hatch lines (``mode="hatch"``). Defaults to ``(0.0, 45.0, 90.0)``.
+    :param str mode: either ``"layered"`` (crosshatch made of rotated text) or ``"hatch"``
+        (text stencil filled with rotated line gratings).
+    :param int font_size: size of the rendered font in pixels. If ``None``, Pillow's default size is used.
+    :param str font_path: path to a TrueType font file. If ``None``, Pillow's built-in font is used.
+    :param int text_spacing: padding in pixels added around the text before tiling, controlling how
+        densely the text repeats.
+    :param int hatch_spacing: period in pixels of the line grating. Only used if ``mode="hatch"``.
+    :param int hatch_width: thickness in pixels of the lines of the grating. Only used if ``mode="hatch"``.
+    :param bool invert: if ``False`` (default), glyph pixels are set to 0 and the background to 1, so
+        the text is the missing region. If ``True``, only the text is kept.
+    :param bool random_angles: if ``True``, ``len(angles)`` angles are sampled uniformly in
+        :math:`[0, 180)` at each step instead of using ``angles``.
+    :param bool random_shift: if ``True``, the tiled text field is randomly translated for each
+        sample in the batch, so that the batch elements differ.
+    :param str, torch.device device: device where the mask is stored (default: 'cpu').
+    :param torch.dtype dtype: the data type of the generated mask.
+    :param torch.Generator rng: torch random number generator.
+
+    |sep|
+
+    :Examples:
+
+        Generate a crosshatched text mask made of text rotated by 0, 45 and 90 degrees:
+
+        >>> from deepinv.physics.generator import CrosshatchTextMaskGenerator
+        >>> gen = CrosshatchTextMaskGenerator((1, 64, 64), text="DEEPINV", angles=(0.0, 45.0, 90.0))
+        >>> mask = gen.step(batch_size=2)["mask"]
+        >>> mask.shape
+        torch.Size([2, 1, 64, 64])
+        >>> bool(((mask == 0) | (mask == 1)).all())  # the mask is binary
+        True
+
+        The rotation matrix used to rotate the text:
+
+        >>> R = CrosshatchTextMaskGenerator.rotation_matrix(90.0)
+        >>> bool(torch.allclose(R, torch.tensor([[0.0, -1.0], [1.0, 0.0]]), atol=1e-6))
+        True
+
+        Fill the glyphs with crosshatch shading instead, using lines at 45 and 135 degrees:
+
+        >>> gen = CrosshatchTextMaskGenerator((1, 64, 64), mode="hatch", angles=(45.0, 135.0))
+        >>> gen.step()["mask"].shape
+        torch.Size([1, 1, 64, 64])
+
+        Use the mask to build a text-removal inpainting problem:
+
+        >>> from deepinv.physics import Inpainting
+        >>> physics = Inpainting((1, 64, 64))
+        >>> x = torch.randn(1, 1, 64, 64)
+        >>> y = physics(x, **gen.step(batch_size=1))
+        >>> y.shape
+        torch.Size([1, 1, 64, 64])
+    """
+
+    def __init__(
+        self,
+        img_size: tuple[int],
+        text: str = "DEEPINV",
+        angles: tuple[float] = (0.0, 45.0, 90.0),
+        mode: str = "layered",
+        font_size: int = None,
+        font_path: str = None,
+        text_spacing: int = 4,
+        hatch_spacing: int = 8,
+        hatch_width: int = 2,
+        invert: bool = False,
+        random_angles: bool = False,
+        random_shift: bool = False,
+        device: str | torch.device = torch.device("cpu"),
+        dtype: torch.dtype = torch.float32,
+        rng: torch.Generator = None,
+        *args,
+        **kwargs,
+    ):
+        super().__init__(*args, device=device, dtype=dtype, rng=rng, **kwargs)
+
+        if mode not in ("layered", "hatch"):
+            raise ValueError(f"mode must either be 'layered' or 'hatch', got '{mode}'.")
+        if len(img_size) not in (2, 3):
+            raise ValueError(
+                f"img_size must be of shape (C, H, W) or (H, W), got {img_size}."
+            )
+        if len(angles) == 0:
+            raise ValueError("At least one angle must be given.")
+
+        self.img_size = img_size
+        self.text = text
+        self.angles = tuple(float(a) for a in angles)
+        self.mode = mode
+        self.font_size = font_size
+        self.font_path = font_path
+        self.text_spacing = text_spacing
+        self.hatch_spacing = hatch_spacing
+        self.hatch_width = hatch_width
+        self.invert = invert
+        self.random_angles = random_angles
+        self.random_shift = random_shift
+        self._tile_cache = None
+
+    @staticmethod
+    def rotation_matrix(
+        angle: float,
+        device: str | torch.device = torch.device("cpu"),
+        dtype: torch.dtype = torch.float32,
+    ) -> torch.Tensor:
+        r"""
+        Build the 2x2 rotation matrix of a given angle.
+
+        .. math::
+
+            R(\theta) = \begin{pmatrix} \cos\theta & -\sin\theta \\ \sin\theta & \cos\theta \end{pmatrix}
+
+        :param float angle: rotation angle in degrees.
+        :param str, torch.device device: device on which to build the matrix.
+        :param torch.dtype dtype: data type of the matrix.
+        :return: tensor of shape ``(2, 2)``.
+        :rtype: torch.Tensor
+        """
+        theta = torch.as_tensor(angle, device=device, dtype=dtype) * torch.pi / 180.0
+        cos, sin = torch.cos(theta), torch.sin(theta)
+        return torch.stack([torch.stack([cos, -sin]), torch.stack([sin, cos])])
+
+    def _render_text(self) -> torch.Tensor:
+        r"""
+        Rasterize ``self.text`` into a binary 2D tensor using Pillow.
+
+        The result is cached, as it only depends on ``text``, ``font_size``, ``font_path`` and
+        ``text_spacing``, which are all fixed at construction.
+
+        :return: tensor of shape ``(h, w)`` with values in {0, 1}, where 1 marks the glyphs.
+        :rtype: torch.Tensor
+        """
+        if self._tile_cache is not None:
+            return self._tile_cache
+
+        try:
+            from PIL import Image, ImageDraw, ImageFont
+        except ImportError as e:  # pragma: no cover
+            raise ImportError(
+                "Pillow is required by CrosshatchTextMaskGenerator to rasterize text. "
+                "Install it with `pip install pillow`."
+            ) from e
+
+        if self.font_path is not None:
+            font = ImageFont.truetype(self.font_path, self.font_size or 20)
+        elif self.font_size is not None:
+            try:
+                font = ImageFont.load_default(self.font_size)
+            except TypeError:  # pragma: no cover - Pillow < 10.1
+                font = ImageFont.load_default()
+        else:
+            font = ImageFont.load_default()
+
+        # Measure the text before drawing it so that no glyph is clipped.
+        left, top, right, bottom = ImageDraw.Draw(Image.new("L", (1, 1))).textbbox(
+            (0, 0), self.text, font=font
+        )
+        pad = self.text_spacing
+        width = max(right - left, 1) + 2 * pad
+        height = max(bottom - top, 1) + 2 * pad
+
+        image = Image.new("L", (width, height), 0)
+        ImageDraw.Draw(image).text(
+            (pad - left, pad - top), self.text, fill=1, font=font
+        )
+
+        tile = torch.frombuffer(bytearray(image.tobytes()), dtype=torch.uint8)
+        self._tile_cache = tile.reshape(height, width).to(**self.factory_kwargs)
+        return self._tile_cache
+
+    def _tile(
+        self, tile: torch.Tensor, size: int, shift: tuple = (0, 0)
+    ) -> torch.Tensor:
+        r"""
+        Repeat a 2D tile until it covers a ``(size, size)`` canvas.
+
+        :param torch.Tensor tile: 2D tensor to repeat.
+        :param int size: side of the square canvas.
+        :param tuple shift: ``(dy, dx)`` translation applied before cropping.
+        :return: tensor of shape ``(size, size)``.
+        :rtype: torch.Tensor
+        """
+        height, width = tile.shape
+        reps = (-(-size // height) + 1, -(-size // width) + 1)
+        canvas = tile.repeat(reps)
+        canvas = torch.roll(canvas, shifts=shift, dims=(0, 1))
+        return canvas[:size, :size]
+
+    def _grating(self, size: int) -> torch.Tensor:
+        r"""
+        Build a horizontal line grating of period ``hatch_spacing`` and thickness ``hatch_width``.
+
+        :param int size: side of the square canvas.
+        :return: tensor of shape ``(size, size)`` with values in {0, 1}.
+        :rtype: torch.Tensor
+        """
+        rows = torch.arange(size, device=self.device)
+        lines = (rows % self.hatch_spacing < self.hatch_width).to(**self.factory_kwargs)
+        return lines.unsqueeze(1).expand(size, size).contiguous()
+
+    def _rotate(self, canvas: torch.Tensor, angle: float) -> torch.Tensor:
+        r"""
+        Rotate a square canvas by ``angle`` degrees about its centre.
+
+        The sampling grid is built from :math:`R(\theta)^{\top}`, since
+        :func:`torch.nn.functional.grid_sample` maps output coordinates back to input
+        coordinates.
+
+        :param torch.Tensor canvas: 2D tensor of shape ``(size, size)``.
+        :param float angle: rotation angle in degrees.
+        :return: rotated tensor of shape ``(size, size)``.
+        :rtype: torch.Tensor
+        """
+        rot = self.rotation_matrix(angle, **self.factory_kwargs)
+        theta = torch.zeros(1, 2, 3, **self.factory_kwargs)
+        theta[:, :, :2] = rot.t()
+
+        canvas = canvas[None, None, ...]
+        grid = F.affine_grid(theta, list(canvas.shape), align_corners=False)
+        rotated = F.grid_sample(
+            canvas, grid, mode="nearest", padding_mode="zeros", align_corners=False
+        )
+        return rotated[0, 0]
+
+    def batch_step(self, img_size: tuple | None = None) -> torch.Tensor:
+        r"""
+        Create one crosshatched text mask, without batch dimension.
+
+        :param tuple img_size: if not ``None``, generate a mask of this 2D shape and override the
+            ``img_size`` attribute, must be of form `(H, W)`.
+        :return: mask of shape given either by ``img_size`` or the class attribute ``img_size``.
+        :rtype: torch.Tensor
+        """
+        size = self.img_size if img_size is None else self.img_size[:-2] + img_size[-2:]
+        height, width = size[-2], size[-1]
+
+        # Canvas large enough that any rotation still covers the whole image.
+        side = int(2.0**0.5 * max(height, width)) + 1
+
+        if self.random_angles:
+            angles = (
+                torch.rand(len(self.angles), generator=self.rng, **self.factory_kwargs)
+                * 180.0
+            ).tolist()
+        else:
+            angles = self.angles
+
+        shift = (0, 0)
+        if self.random_shift:
+            shift = tuple(
+                torch.randint(
+                    0, side, (2,), generator=self.rng, device=self.device
+                ).tolist()
+            )
+
+        tile = self._render_text()
+        text_field = self._tile(tile, side, shift=shift)
+
+        if self.mode == "layered":
+            layers = [self._rotate(text_field, angle) for angle in angles]
+            field = torch.stack(layers).amax(dim=0)
+        else:
+            grating = self._grating(side)
+            hatch = torch.stack([self._rotate(grating, a) for a in angles]).amax(dim=0)
+            field = text_field * hatch
+
+        # Centre crop the canvas back to the image size.
+        top = (side - height) // 2
+        left = (side - width) // 2
+        field = field[top : top + height, left : left + width]
+
+        mask = field if self.invert else 1.0 - field
+
+        if len(size) == 3:
+            mask = mask.expand(size[0], height, width)
+
+        return mask.contiguous()
+
+    def step(
+        self,
+        batch_size: int = 1,
+        seed: int = None,
+        img_size: tuple | None = None,
+        **kwargs,
+    ) -> dict:
+        r"""
+        Generate a batch of crosshatched text masks.
+
+        The masks of a batch are identical unless ``random_angles`` or ``random_shift`` is set.
+
+        :param int batch_size: batch size. If ``None``, no batch dimension is created.
+        :param int seed: the seed for the random number generator.
+        :param tuple img_size: if not ``None``, generate masks of this 2D image shape and override
+            the ``img_size`` attribute, must be of form `(H, W)`.
+        :return: dictionary with key **'mask'**: tensor of size ``(batch_size, *img_size)`` with
+            values in {0, 1}.
+        :rtype: dict
+        """
+        self.rng_manual_seed(seed)
+
+        if batch_size is None:
+            return {"mask": self.batch_step(img_size=img_size)}
+
+        masks = [self.batch_step(img_size=img_size) for _ in range(batch_size)]
+        return {"mask": torch.stack(masks)}
