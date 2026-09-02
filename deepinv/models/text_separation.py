@@ -47,7 +47,7 @@ class TextLayerSeparator(nn.Module):
 
     Inverts :class:`deepinv.physics.CrosshatchTextOverlay`: given
 
-    ``y = a + w_1 * rotate(s_1, angle_1) + ... + w_K * rotate(s_K, angle_K)``
+    ``y = crop( a + w_1 * rotate(s_1, angle_1) + ... + w_K * rotate(s_K, angle_K) )``
 
     the network predicts all ``K+1`` sources at once, returning a tensor of shape
     ``(B, K+1, C, S, S)`` whose component 0 is the background ``a`` and whose component ``k+1`` is

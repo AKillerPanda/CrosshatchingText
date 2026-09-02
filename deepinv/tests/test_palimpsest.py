@@ -357,6 +357,29 @@ def test_rejects_angles_without_img_size():
         PalimpsestOpticalDensity(torch.rand(2, N_BANDS), angles=(0.0, 90.0))
 
 
+def test_rejects_angles_set_after_construction_without_img_size():
+    """Rotating layers needs a crop target, whether the angles come early or late."""
+    physics = PalimpsestOpticalDensity(torch.rand(2, N_BANDS))
+
+    with pytest.raises(ValueError, match="without img_size"):
+        physics.update_parameters(angles=(0.0, 90.0))
+
+
+def test_angles_none_leaves_rotations_unchanged(device):
+    """
+    ``None`` means "unchanged" in update_parameters, not "cleared".
+
+    That is deepinv's convention for every parameter, but it reads as a trap here because
+    ``angles=None`` in the constructor means something different, so pin the behaviour down.
+    """
+    physics = palimpsest(angles=(0.0, 90.0), device=device)
+
+    physics.update_parameters(angles=None)
+
+    assert physics.layer_size == (46, 46)
+    assert torch.allclose(physics.angles, torch.tensor([0.0, 90.0], device=device))
+
+
 def test_rejects_bad_img_size():
     with pytest.raises(ValueError, match=r"\(C, H, W\)"):
         PalimpsestAttenuation((32, 32))

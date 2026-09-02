@@ -228,12 +228,26 @@ class PalimpsestOpticalDensity(LinearPhysics):
         r"""
         Set the absorption spectra and/or the per-layer rotations.
 
+        .. note::
+
+            Following the convention of :meth:`deepinv.physics.Physics.update_parameters`, a
+            parameter left at ``None`` is *unchanged*, not cleared. Passing ``angles=None`` here
+            therefore keeps the current rotations rather than removing them, even though
+            ``angles=None`` in the constructor means the layers are not rotated at all. Build a
+            new operator to go from rotated layers back to unrotated ones.
+
         :param torch.Tensor absorption: new absorption spectra of shape ``(K, C)``.
         :param tuple, torch.Tensor angles: new rotation of each layer, in degrees.
         """
         if absorption is not None:
             absorption = torch.as_tensor(absorption, dtype=torch.float32)
         if angles is not None:
+            if self.img_size is None:
+                raise ValueError(
+                    "this operator was built without img_size, so its layers live on the image "
+                    "grid and cannot be rotated; rotated layers live on a canvas that has to be "
+                    "cropped down to a known image size. Build it with img_size instead."
+                )
             reference = self.absorption if absorption is None else absorption
             angles = self._as_angles(angles, reference)
         super().update_parameters(absorption=absorption, angles=angles, **kwargs)
