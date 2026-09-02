@@ -685,7 +685,8 @@ class CrosshatchTextMaskGenerator(PhysicsGenerator):
         specific TrueType font for reproducible glyphs across machines.
 
     :param tuple[int] img_size: size of the mask without batch dimension, of shape `(C, H, W)` or `(H, W)`.
-    :param str text: text to render into the mask.
+    :param str text: text to render into the mask. Override it for a single call by passing
+        ``text`` to :meth:`step`, :meth:`batch_step` or :meth:`layer_fields`.
     :param tuple[float] angles: rotation angles in degrees applied to the text (``mode="layered"``)
         or to the hatch lines (``mode="hatch"``). Defaults to ``(0.0, 45.0, 90.0)``.
     :param str mode: either ``"layered"`` (crosshatch made of rotated text) or ``"hatch"``
@@ -698,8 +699,12 @@ class CrosshatchTextMaskGenerator(PhysicsGenerator):
     :param int hatch_width: thickness in pixels of the lines of the grating. Only used if ``mode="hatch"``.
     :param bool invert: if ``False`` (default), glyph pixels are set to 0 and the background to 1, so
         the text is the missing region. If ``True``, only the text is kept.
-    :param bool random_angles: if ``True``, ``len(angles)`` angles are sampled uniformly in
-        ``[0, 180)`` at each step instead of using ``angles``.
+    :param bool random_angles: if ``True``, ``len(angles)`` angles are sampled uniformly from
+        ``angle_range`` at each step instead of using ``angles``. An explicit ``angles`` passed to
+        :meth:`step` still wins over the draw.
+    :param tuple[float] angle_range: ``(low, high)`` bounds in degrees of the random draw. Only
+        used if ``random_angles`` is ``True``. Narrow it to model a known writing direction, e.g.
+        ``(85.0, 95.0)`` for undertext running roughly across the page.
     :param bool random_shift: if ``True``, the tiled text field is randomly translated for each
         sample in the batch, so that the batch elements differ.
     :param str, torch.device device: device where the mask is stored (default: 'cpu').
@@ -742,6 +747,11 @@ class CrosshatchTextMaskGenerator(PhysicsGenerator):
         torch.Size([1, 1, 64, 64])
     """
 
+    #: Maximum number of rasterized tiles kept at once. Rendering a string is the expensive part
+    #: of a step, so tiles are cached, but ``text`` is a per-call argument and a caller may pass
+    #: unboundedly many distinct strings; the cache is capped and evicts the least recently used.
+    max_tile_cache: int = 32
+
     def __init__(
         self,
         img_size: tuple[int],
@@ -755,6 +765,7 @@ class CrosshatchTextMaskGenerator(PhysicsGenerator):
         hatch_width: int = 2,
         invert: bool = False,
         random_angles: bool = False,
+        angle_range: tuple[float, float] = (0.0, 180.0),
         random_shift: bool = False,
         device: str | torch.device = torch.device("cpu"),
         dtype: torch.dtype = torch.float32,
@@ -772,10 +783,15 @@ class CrosshatchTextMaskGenerator(PhysicsGenerator):
             )
         if len(angles) == 0:
             raise ValueError("At least one angle must be given.")
+        if len(angle_range) != 2 or angle_range[0] >= angle_range[1]:
+            raise ValueError(
+                f"angle_range must be an increasing (low, high) pair, got {angle_range}."
+            )
 
         self.img_size = img_size
         self.text = text
         self.angles = tuple(float(a) for a in angles)
+        self.angle_range = (float(angle_range[0]), float(angle_range[1]))
         self.mode = mode
         self.font_size = font_size
         self.font_path = font_path
@@ -786,6 +802,44 @@ class CrosshatchTextMaskGenerator(PhysicsGenerator):
         self.random_angles = random_angles
         self.random_shift = random_shift
         self._tile_cache: dict[str, torch.Tensor] = {}
+
+    def resolve_angles(self, angles: tuple[float] | None = None) -> tuple:
+        r"""
+        The angles to use for one call.
+
+        An explicit ``angles`` wins over everything, so a caller can always say exactly what it
+        wants. Otherwise, if ``random_angles`` is set, one angle per layer is drawn uniformly
+        from ``angle_range``; failing that, the angles given at construction are used.
+
+        :param tuple[float] angles: angles in degrees to use instead of the stored ones.
+        :return: tuple of angles in degrees.
+        :rtype: tuple
+        """
+        if angles is not None:
+            if len(angles) == 0:
+                raise ValueError("At least one angle must be given.")
+            return tuple(float(a) for a in angles)
+
+        if self.random_angles:
+            low, high = self.angle_range
+            drawn = (
+                torch.rand(len(self.angles), generator=self.rng, **self.factory_kwargs)
+                * (high - low)
+                + low
+            )
+            return tuple(drawn.tolist())
+
+        return self.angles
+
+    def resolve_text(self, text: str | None = None) -> str:
+        r"""
+        The string to use for one call, i.e. ``text`` if given and the stored one otherwise.
+
+        :param str text: string to render instead of the stored one.
+        :return: the string to render.
+        :rtype: str
+        """
+        return self.text if text is None else text
 
     @staticmethod
     def rotation_matrix(
@@ -815,14 +869,20 @@ class CrosshatchTextMaskGenerator(PhysicsGenerator):
 
         Results are cached per string, as a tile only depends on the text and on
         ``font_size``, ``font_path`` and ``text_spacing``, which are fixed at construction.
+        Since callers may pass a different ``text`` on every call, the cache is capped at
+        ``max_tile_cache`` entries and evicts the least recently used one, so a loop over many
+        distinct strings cannot grow it without bound.
 
         :param str text: string to rasterize. If ``None``, ``self.text`` is used.
         :return: tensor of shape ``(h, w)`` with values in {0, 1}, where 1 marks the glyphs.
         :rtype: torch.Tensor
         """
         text = self.text if text is None else text
-        if text in self._tile_cache:
-            return self._tile_cache[text]
+        cached = self._tile_cache.pop(text, None)
+        if cached is not None:
+            # Reinsert so the most recently used entry is last, i.e. evicted last.
+            self._tile_cache[text] = cached
+            return cached
 
         try:
             from PIL import Image, ImageDraw, ImageFont
@@ -855,8 +915,13 @@ class CrosshatchTextMaskGenerator(PhysicsGenerator):
         ImageDraw.Draw(image).text((pad - left, pad - top), text, fill=1, font=font)
 
         tile = torch.frombuffer(bytearray(image.tobytes()), dtype=torch.uint8)
-        self._tile_cache[text] = tile.reshape(height, width).to(**self.factory_kwargs)
-        return self._tile_cache[text]
+        rendered = tile.reshape(height, width).to(**self.factory_kwargs)
+
+        self._tile_cache[text] = rendered
+        while len(self._tile_cache) > self.max_tile_cache:
+            # Dicts keep insertion order, so the first key is the least recently used.
+            del self._tile_cache[next(iter(self._tile_cache))]
+        return rendered
 
     def _tile(
         self, tile: torch.Tensor, size: int, shift: tuple = (0, 0)
@@ -913,7 +978,11 @@ class CrosshatchTextMaskGenerator(PhysicsGenerator):
         return rotated[0, 0]
 
     def layer_fields(
-        self, img_size: tuple | None = None, canvas: bool = False
+        self,
+        img_size: tuple | None = None,
+        canvas: bool = False,
+        text: str | None = None,
+        angles: tuple[float] | None = None,
     ) -> torch.Tensor:
         r"""
         Return the individual text layers, before they are combined into a single mask.
@@ -925,6 +994,9 @@ class CrosshatchTextMaskGenerator(PhysicsGenerator):
 
         :param tuple img_size: if not ``None``, generate layers of this 2D shape and override
             the ``img_size`` attribute, must be of form `(H, W)`.
+        :param str text: string to render instead of the stored ``text``, for this call only.
+        :param tuple[float] angles: angles in degrees to use instead of the stored ``angles``, for
+            this call only. Takes precedence over ``random_angles``.
         :param bool canvas: if ``True``, return the layers on the full ``(S, S)`` canvas they are
             rendered on rather than cropped to the image, where
             ``S = deepinv.physics.canvas_size(img_size)``. That is the domain the separation
@@ -940,13 +1012,7 @@ class CrosshatchTextMaskGenerator(PhysicsGenerator):
         # Canvas large enough that any rotation still covers the whole image.
         side = int(2.0**0.5 * max(height, width)) + 1
 
-        if self.random_angles:
-            angles = (
-                torch.rand(len(self.angles), generator=self.rng, **self.factory_kwargs)
-                * 180.0
-            ).tolist()
-        else:
-            angles = self.angles
+        angles = self.resolve_angles(angles)
 
         shift = (0, 0)
         if self.random_shift:
@@ -956,7 +1022,7 @@ class CrosshatchTextMaskGenerator(PhysicsGenerator):
                 ).tolist()
             )
 
-        tile = self._render_text()
+        tile = self._render_text(self.resolve_text(text))
         text_field = self._tile(tile, side, shift=shift)
 
         if self.mode == "layered":
@@ -976,7 +1042,7 @@ class CrosshatchTextMaskGenerator(PhysicsGenerator):
         left = (side - width) // 2
         return stacked[:, top : top + height, left : left + width].contiguous()
 
-    def batch_step(self, img_size: tuple | None = None) -> torch.Tensor:
+    def batch_step(self, img_size: tuple | None = None, **kwargs) -> torch.Tensor:
         r"""
         Create one crosshatched text mask, without batch dimension.
 
@@ -989,7 +1055,7 @@ class CrosshatchTextMaskGenerator(PhysicsGenerator):
         height, width = size[-2], size[-1]
 
         # A pixel is crosshatched as soon as one layer covers it.
-        field = self.layer_fields(img_size=img_size).amax(dim=0)
+        field = self.layer_fields(img_size=img_size, **kwargs).amax(dim=0)
 
         mask = field if self.invert else 1.0 - field
 
@@ -1014,6 +1080,10 @@ class CrosshatchTextMaskGenerator(PhysicsGenerator):
         :param int seed: the seed for the random number generator.
         :param tuple img_size: if not ``None``, generate masks of this 2D image shape and override
             the ``img_size`` attribute, must be of form `(H, W)`.
+        :param dict kwargs: per-call overrides forwarded to :meth:`layer_fields`, i.e. ``text``
+            and ``angles`` (and ``texts`` for
+            :class:`deepinv.physics.generator.MultiTextCrosshatchMaskGenerator`), so one generator
+            can render any string at any angle without being rebuilt.
         :return: dictionary with key **'mask'**: tensor of size ``(batch_size, *img_size)`` with
             values in {0, 1}.
         :rtype: dict
@@ -1021,9 +1091,11 @@ class CrosshatchTextMaskGenerator(PhysicsGenerator):
         self.rng_manual_seed(seed)
 
         if batch_size is None:
-            return {"mask": self.batch_step(img_size=img_size)}
+            return {"mask": self.batch_step(img_size=img_size, **kwargs)}
 
-        masks = [self.batch_step(img_size=img_size) for _ in range(batch_size)]
+        masks = [
+            self.batch_step(img_size=img_size, **kwargs) for _ in range(batch_size)
+        ]
         return {"mask": torch.stack(masks)}
 
 
@@ -1103,10 +1175,38 @@ class MultiTextCrosshatchMaskGenerator(CrosshatchTextMaskGenerator):
         :return: tuple of strings, of the same length as ``angles``.
         :rtype: tuple
         """
-        return tuple(self.texts[k % len(self.texts)] for k in range(len(self.angles)))
+        return self.texts_for_angles()
+
+    def texts_for_angles(
+        self, angles: tuple[float] | None = None, texts: tuple[str] | None = None
+    ) -> tuple:
+        r"""
+        The string used by each layer, for one call.
+
+        ``texts`` is cycled to the length of ``angles``, so any number of strings spreads over any
+        number of layers: two strings over four angles alternate, one string over three angles
+        repeats. Both arguments default to the values given at construction, so this is also how
+        a caller overrides either of them for a single call.
+
+        :param tuple[float] angles: the angles of this call, whose length sets how many strings
+            come back.
+        :param tuple[str] texts: the strings to cycle, instead of the stored ones.
+        :return: tuple of strings, of the same length as ``angles``.
+        :rtype: tuple
+        """
+        angles = self.angles if angles is None else angles
+        texts = self.texts if texts is None else tuple(texts)
+        if len(texts) == 0:
+            raise ValueError("At least one text must be given.")
+        return tuple(texts[k % len(texts)] for k in range(len(angles)))
 
     def layer_fields(
-        self, img_size: tuple | None = None, canvas: bool = False
+        self,
+        img_size: tuple | None = None,
+        canvas: bool = False,
+        text: str | None = None,
+        angles: tuple[float] | None = None,
+        texts: tuple[str] | None = None,
     ) -> torch.Tensor:
         r"""
         Return the individual text layers, one per angle, each with its own text.
@@ -1116,6 +1216,10 @@ class MultiTextCrosshatchMaskGenerator(CrosshatchTextMaskGenerator):
 
         :param tuple img_size: if not ``None``, generate layers of this 2D shape and override
             the ``img_size`` attribute, must be of form `(H, W)`.
+        :param str text: a single string used for every layer, for this call only. Equivalent
+            to ``texts=(text,)``, and ignored if ``texts`` is given.
+        :param tuple[float] angles: angles in degrees to use instead of the stored ``angles``.
+        :param tuple[str] texts: strings to cycle over the layers instead of the stored ``texts``.
         :param bool canvas: if ``True``, return the layers on the full ``(S, S)`` canvas rather
             than cropped to the image, which is the domain the separation operators expect.
         :return: tensor of shape ``(len(angles), H, W)``, or ``(len(angles), S, S)`` if ``canvas``
@@ -1128,13 +1232,10 @@ class MultiTextCrosshatchMaskGenerator(CrosshatchTextMaskGenerator):
         # Canvas large enough that any rotation still covers the whole image.
         side = int(2.0**0.5 * max(height, width)) + 1
 
-        if self.random_angles:
-            angles = (
-                torch.rand(len(self.angles), generator=self.rng, **self.factory_kwargs)
-                * 180.0
-            ).tolist()
-        else:
-            angles = self.angles
+        angles = self.resolve_angles(angles)
+        # A single ``text`` is the one-string form of ``texts``, cycled over every layer.
+        if texts is None and text is not None:
+            texts = (text,)
 
         shift = (0, 0)
         if self.random_shift:
@@ -1146,7 +1247,9 @@ class MultiTextCrosshatchMaskGenerator(CrosshatchTextMaskGenerator):
 
         # Each layer is tiled from its own text, so the strings may have different lengths.
         layers = []
-        for text, angle in zip(self.texts_per_angle, angles, strict=True):
+        for text, angle in zip(
+            self.texts_for_angles(angles, texts), angles, strict=True
+        ):
             text_field = self._tile(self._render_text(text), side, shift=shift)
             if self.mode == "layered":
                 layers.append(self._rotate(text_field, angle))

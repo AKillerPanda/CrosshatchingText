@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import math
+
 import torch
 import torch.nn.functional as F
 
@@ -354,6 +356,10 @@ class PalimpsestAttenuation(Physics):
     :param torch.Tensor absorption: absorption spectra of shape ``(K, C)``, non-negative. If
         ``None``, ``n_layers`` spectra are built by :meth:`default_absorption`.
     :param int n_layers: number of ink layers ``K``. Ignored if ``absorption`` is given.
+    :param tuple[float] decay_range: bounds of the decay rates used to build the stand-in spectra,
+        see :meth:`default_absorption`. Ignored if ``absorption`` is given. Kept afterwards as the
+        ``decay_range`` attribute, which is ``None`` when ``absorption`` was supplied — so it also
+        says whether the spectra of this operator are measured or stood in for.
     :param float, torch.Tensor substrate: reflectance :math:`R` of the ink-free support, as a
         scalar, a per-band vector of shape ``(C,)``, or a map of shape ``(C, H, W)``. Estimate it
         from a measurement with :func:`deepinv.physics.estimate_substrate`.
@@ -422,6 +428,7 @@ class PalimpsestAttenuation(Physics):
         angles: tuple[float] | torch.Tensor | None = None,
         mode: str = "bilinear",
         device: str | torch.device = torch.device("cpu"),
+        decay_range: tuple[float, float] = (0.5, 8.0),
         **kwargs,
     ):
         super().__init__(**kwargs)
@@ -435,7 +442,8 @@ class PalimpsestAttenuation(Physics):
         if absorption is None:
             if n_layers < 1:
                 raise ValueError(f"n_layers must be at least 1, got {n_layers}.")
-            absorption = self.default_absorption(n_layers, n_bands)
+            absorption = self.default_absorption(n_layers, n_bands, decay_range)
+            self.decay_range = (float(decay_range[0]), float(decay_range[1]))
         else:
             absorption = torch.as_tensor(absorption, dtype=torch.float32)
             if absorption.ndim == 2 and absorption.shape[1] != n_bands:
@@ -443,6 +451,8 @@ class PalimpsestAttenuation(Physics):
                     f"absorption must have one column per band, got "
                     f"{absorption.shape[1]} columns for {n_bands} bands."
                 )
+            # The spectra were supplied, so no stand-in bounds were used to build them.
+            self.decay_range = None
 
         self.img_size = tuple(img_size)
         self.density = PalimpsestOpticalDensity(
@@ -456,23 +466,61 @@ class PalimpsestAttenuation(Physics):
         self.to(device)
 
     @staticmethod
-    def default_absorption(n_layers: int, n_bands: int) -> torch.Tensor:
+    def default_absorption(
+        n_layers: int, n_bands: int, decay_range: tuple[float, float] = (0.5, 8.0)
+    ) -> torch.Tensor:
         r"""
-        Build a default set of ink absorption spectra.
+        Build a stand-in set of ink absorption spectra.
 
         Row ``k`` decays as ``exp(-b * d_k)`` over bands ``b`` linearly spaced in ``[0, 1]``, with
-        the decay rates ``d_k`` spread over ``[0.5, 8]``. Slowly-decaying rows stand for inks that
-        stay opaque across the whole range, fast-decaying ones for inks that turn transparent
+        the decay rates ``d_k`` spread over ``decay_range``. Slowly-decaying rows stand for inks
+        that stay opaque across the whole range, fast-decaying ones for inks that turn transparent
         towards the far bands. The rows are distinct by construction, which is what makes the
-        layers separable at all; the values are plausible, not measured.
+        layers separable at all.
+
+        These are plausible spectra, not measured ones. For real work, pass the ``absorption``
+        matrix directly: measured ink spectra are what make a recovered layer mean anything, and a
+        wider ``decay_range`` makes the problem easier than any real manuscript is.
 
         :param int n_layers: number of ink layers ``K``.
         :param int n_bands: number of spectral bands ``C``.
+        :param tuple[float] decay_range: ``(low, high)`` bounds of the decay rates, spread evenly
+            over the layers. Widening it separates the inks further and makes recovery easier.
         :return: absorption spectra of shape ``(K, C)``.
         :rtype: torch.Tensor
+
+        |sep|
+
+        :Examples:
+
+            Inks that differ only slightly are far harder to tell apart:
+
+            >>> import torch
+            >>> from deepinv.physics import PalimpsestAttenuation
+            >>> easy = PalimpsestAttenuation.default_absorption(2, 8)
+            >>> hard = PalimpsestAttenuation.default_absorption(2, 8, decay_range=(1.0, 1.2))
+            >>> bool(torch.linalg.cond(easy) < torch.linalg.cond(hard))
+            True
         """
+        if len(decay_range) != 2 or decay_range[0] > decay_range[1]:
+            raise ValueError(
+                f"decay_range must be an increasing (low, high) pair, got {decay_range}."
+            )
+        low, high = float(decay_range[0]), float(decay_range[1])
+        if not (math.isfinite(low) and math.isfinite(high)):
+            raise ValueError(
+                f"decay_range must be finite, got {decay_range}: a non-finite bound gives "
+                "spectra that are all nan or all zero."
+            )
+        if n_layers > 1 and low == high:
+            raise ValueError(
+                f"decay_range must have distinct bounds for {n_layers} layers, got "
+                f"{decay_range}: equal bounds give every ink the same spectrum, and layers with "
+                "the same spectrum cannot be told apart."
+            )
+
         bands = torch.linspace(0.0, 1.0, n_bands)
-        decay = torch.linspace(0.5, 8.0, n_layers)
+        decay = torch.linspace(low, high, n_layers)
         return torch.exp(-bands[None, :] * decay[:, None])
 
     @staticmethod

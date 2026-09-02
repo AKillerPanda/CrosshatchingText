@@ -849,6 +849,139 @@ def test_multitext_layer_fields_canvas(device, rng):
     )
 
 
+def test_crosshatch_tile_cache_is_bounded(device, rng):
+    """
+    Per-call ``text`` means a caller controls the cache keys, so it must not grow without bound.
+
+    Rendering is cached because it is the expensive part of a step, but a loop over unique
+    strings would otherwise retain every tile for the life of the generator.
+    """
+    gen = choose_crosshatch_generator("layered", (1, 32, 32), device, rng)
+    cap = gen.max_tile_cache
+
+    for i in range(cap * 4):
+        gen.step(batch_size=1, text=f"UNIQUE-{i}")
+
+    assert len(gen._tile_cache) <= cap
+    # The oldest overrides were evicted rather than retained
+    assert "UNIQUE-0" not in gen._tile_cache
+    assert f"UNIQUE-{cap * 4 - 1}" in gen._tile_cache
+
+
+def test_crosshatch_tile_cache_still_caches(device, rng):
+    """Eviction must not break the caching that makes repeated steps cheap."""
+    gen = choose_crosshatch_generator("layered", (1, 32, 32), device, rng, text="KEEP")
+
+    first = gen.step(batch_size=1)["mask"]
+    assert "KEEP" in gen._tile_cache
+    assert torch.equal(first, gen.step(batch_size=1)["mask"])
+
+    # A recently used entry survives eviction pressure from later unique strings
+    for i in range(gen.max_tile_cache - 1):
+        gen.step(batch_size=1, text=f"OTHER-{i}")
+    assert "KEEP" in gen._tile_cache
+
+
+def test_multitext_tile_cache_is_bounded(device, rng):
+    """The per-layer texts path shares the same cache and the same bound."""
+    gen = multitext_generator(device, rng, texts=("A", "B"), angles=(0.0, 90.0))
+
+    for i in range(gen.max_tile_cache * 3):
+        gen.layer_fields(texts=(f"U{i}", f"V{i}"))
+
+    assert len(gen._tile_cache) <= gen.max_tile_cache
+
+
+def test_crosshatch_text_override_per_call(device, rng):
+    """The string is a per-call argument, not something baked into the generator."""
+    gen = choose_crosshatch_generator("layered", (1, 64, 64), device, rng, text="AAA")
+
+    default = gen.step(batch_size=1)["mask"]
+    other = gen.step(batch_size=1, text="ZZZZZZ")
+    again = gen.step(batch_size=1, text="AAA")["mask"]
+
+    assert not torch.equal(default, other["mask"])
+    # The override is for one call only, it does not mutate the generator
+    assert gen.text == "AAA"
+    assert torch.equal(default, again)
+
+
+def test_crosshatch_angles_override_per_call(device, rng):
+    """Angles are a per-call argument too, and may differ in number from the stored ones."""
+    gen = choose_crosshatch_generator(
+        "layered", (1, 64, 64), device, rng, angles=(0.0, 90.0)
+    )
+
+    default = gen.step(batch_size=1)["mask"]
+    turned = gen.step(batch_size=1, angles=(30.0, 120.0))["mask"]
+    three = gen.layer_fields(angles=(0.0, 60.0, 120.0))
+
+    assert not torch.equal(default, turned)
+    assert gen.angles == (0.0, 90.0)
+    assert three.shape[0] == 3
+
+
+def test_crosshatch_explicit_angles_beat_random(device, rng):
+    """random_angles must not override an angle the caller asked for explicitly."""
+    gen = choose_crosshatch_generator(
+        "layered", (1, 64, 64), device, rng, angles=(0.0, 90.0), random_angles=True
+    )
+
+    a = gen.layer_fields(angles=(15.0, 75.0))
+    b = gen.layer_fields(angles=(15.0, 75.0))
+
+    assert torch.equal(a, b)  # deterministic despite random_angles
+
+
+@pytest.mark.parametrize("angle_range", [(0.0, 180.0), (85.0, 95.0), (0.0, 1.0)])
+def test_crosshatch_angle_range(angle_range, device, rng):
+    """The random draw is bounded by angle_range, not hardcoded to [0, 180)."""
+    gen = choose_crosshatch_generator(
+        "layered",
+        (1, 32, 32),
+        device,
+        rng,
+        angles=(0.0, 90.0),
+        random_angles=True,
+        angle_range=angle_range,
+    )
+
+    drawn = [a for _ in range(20) for a in gen.resolve_angles()]
+
+    assert all(angle_range[0] <= a <= angle_range[1] for a in drawn)
+
+
+def test_crosshatch_rejects_bad_angle_range(device, rng):
+    with pytest.raises(ValueError, match="increasing"):
+        choose_crosshatch_generator(
+            "layered", (1, 32, 32), device, rng, angle_range=(90.0, 10.0)
+        )
+
+
+def test_multitext_texts_override_per_call(device, rng):
+    """texts, and a single text applied to every layer, are both per-call arguments."""
+    gen = multitext_generator(device, rng, texts=("AAA", "BBB"), angles=(0.0, 90.0))
+
+    default = gen.layer_fields()
+    swapped = gen.layer_fields(texts=("ZZZ", "YYY"))
+    single = gen.layer_fields(text="QQQ")
+
+    assert not torch.equal(default, swapped)
+    assert gen.texts == ("AAA", "BBB")
+    # A single text is the one-string form: every layer carries it
+    assert torch.equal(single, gen.layer_fields(texts=("QQQ",)))
+
+
+def test_multitext_texts_for_angles_cycles(device, rng):
+    """Any number of strings spreads over any number of layers."""
+    gen = multitext_generator(device, rng, texts=("A", "B"), angles=(0.0, 90.0))
+
+    assert gen.texts_for_angles(angles=(0.0, 45.0, 90.0, 135.0)) == ("A", "B", "A", "B")
+    assert gen.texts_for_angles(angles=(0.0, 45.0), texts=("Z",)) == ("Z", "Z")
+    with pytest.raises(ValueError, match="At least one text"):
+        gen.texts_for_angles(texts=())
+
+
 def test_crosshatch_as_overlay_source(device, rng):
     """Use 2, end to end: upright layers compose additively through CrosshatchTextOverlay."""
     img_size = (1, 64, 64)

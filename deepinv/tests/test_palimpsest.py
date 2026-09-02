@@ -264,6 +264,63 @@ def test_rotation_is_actually_applied(device):
 # ------------------------------------------------------------------- parameters
 
 
+def test_decay_range_is_recorded(device):
+    """The bounds are kept, and are None when the spectra were supplied rather than stood in."""
+    generated = palimpsest(device=device)
+    supplied = PalimpsestAttenuation(
+        (N_BANDS, 32, 32), absorption=torch.rand(2, N_BANDS), device=device
+    )
+
+    assert generated.decay_range == (0.5, 8.0)
+    assert PalimpsestAttenuation(
+        (N_BANDS, 32, 32), decay_range=(1.0, 2.0), device=device
+    ).decay_range == (1.0, 2.0)
+    assert supplied.decay_range is None
+
+
+def test_decay_range_widens_the_gap_between_inks(device):
+    physics = palimpsest(decay_range=(1.0, 9.0), device=device)
+
+    assert physics.decay_range == (1.0, 9.0)
+    assert not torch.allclose(physics.absorption[0], physics.absorption[1], atol=1e-3)
+
+
+def test_positional_args_still_bind_to_mode(device):
+    """decay_range must not sit between angles and mode, or positional calls silently shift."""
+    physics = PalimpsestAttenuation(
+        (N_BANDS, 32, 32), None, 2, 1.0, (0.0, 90.0), "nearest"
+    )
+
+    assert physics.density.mode == "nearest"
+    assert physics.decay_range == (0.5, 8.0)
+
+
+@pytest.mark.parametrize("bad", [(float("nan"), 1.0), (0.5, float("inf"))])
+def test_rejects_non_finite_decay_range(bad):
+    """A non-finite bound silently produces all-nan or all-zero spectra."""
+    with pytest.raises(ValueError, match="finite"):
+        PalimpsestAttenuation.default_absorption(2, N_BANDS, bad)
+
+
+def test_rejects_equal_decay_range_for_several_layers():
+    """Equal bounds give every ink the same spectrum, so the layers cannot be separated."""
+    with pytest.raises(ValueError, match="distinct bounds"):
+        PalimpsestAttenuation.default_absorption(2, N_BANDS, (2.0, 2.0))
+
+
+def test_allows_equal_decay_range_for_one_layer():
+    """With a single layer there is nothing to tell apart, so equal bounds are fine."""
+    assert PalimpsestAttenuation.default_absorption(1, N_BANDS, (2.0, 2.0)).shape == (
+        1,
+        N_BANDS,
+    )
+
+
+def test_rejects_decreasing_decay_range():
+    with pytest.raises(ValueError, match="increasing"):
+        PalimpsestAttenuation.default_absorption(2, N_BANDS, (8.0, 0.5))
+
+
 def test_default_absorption_rows_are_distinct(device):
     """Layers are separable only because their spectra differ."""
     absorption = PalimpsestAttenuation.default_absorption(3, N_BANDS)
